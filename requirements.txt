@@ -1,0 +1,18 @@
+# Core dependencies
+numpy>=1.24.0,<2.0.0
+gradio>=4.40.0,<5.0.0
+
+# Audio processing (requires portaudio system package)
+PyAudio>=0.2.14
+
+# Video processing (requires ffmpeg installed on system)
+moviepy>=2.0.0
+
+# Transcription engines
+faster-whisper>=1.0.0
+openai>=1.0.0
+
+# Note: System requirements
+# - macOS: brew install portaudio ffmpeg
+# - Ubuntu/Debian: sudo apt-get install portaudio19-dev ffmpeg
+# - Windows: Install ffmpeg from https://ffmpeg.org/download.html
