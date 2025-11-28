@@ -82,6 +82,10 @@ class LiveMeetingApp:
         self.speaker_id_reverse_map = {} # {"Speaker X": whisperx_speaker_label}
         self.speaker_id_colors = {} # {"Speaker X": color_hex}
         self.speaker_id_color_index = 0
+        
+        # Role Mapping
+        self.role_mapping = {} # {"SPEAKER_01": "Product Manager"}
+        self.role_embeddings = {} # {"Product Manager": [vector...]}
 
         
     def initialize_components(
@@ -456,7 +460,9 @@ class LiveMeetingApp:
                 speaker = segment.get('speaker')
                 
                 if speaker:
-                    line = f"[{start_time}] [{speaker}] {text}\n\n"
+                    # Apply mapping if available
+                    display_name = self.get_mapped_speaker(speaker)
+                    line = f"[{start_time}] [{display_name}] {text}\n\n"
                 else:
                     line = f"[{start_time}] {text}\n\n"
                 
@@ -542,7 +548,57 @@ class LiveMeetingApp:
 
 
 
-    
+
+
+    def apply_role_mapping(self, json_str: str) -> tuple[str, str]:
+        """
+        Parse JSON mapping and generate embeddings for roles.
+        """
+        if not json_str or not json_str.strip():
+            return "⚠️ Please enter a JSON mapping.", ""
+            
+        try:
+            mapping = json.loads(json_str)
+            if not isinstance(mapping, dict):
+                return "❌ Invalid format. Expected a JSON object (dictionary).", ""
+            
+            self.role_mapping = mapping
+            self.role_embeddings = {}
+            
+            # Lazy init analyzer
+            if not self.text_analyzer:
+                try:
+                    self.text_analyzer = TextAnalyzer(device=self.device)
+                except Exception as e:
+                    return f"❌ Error initializing Text Analyzer: {str(e)}", ""
+            
+            # Generate embeddings
+            embedding_info = "✅ Mapping Applied & Embeddings Generated:\n\n"
+            
+            for speaker_id, role in mapping.items():
+                embedding = self.text_analyzer.get_embedding(role)
+                if embedding is not None:
+                    self.role_embeddings[role] = embedding
+                    # Show first 5 dims
+                    preview = ", ".join([f"{x:.4f}" for x in embedding[:5]])
+                    embedding_info += f"🔹 {speaker_id} ➔ {role}\n"
+                    embedding_info += f"   Vector (384-dim): [{preview}, ...]\n\n"
+                else:
+                    embedding_info += f"🔸 {speaker_id} ➔ {role} (Embedding failed)\n\n"
+            
+            return "✅ Role mapping applied successfully!", embedding_info
+            
+        except json.JSONDecodeError:
+            return "❌ Invalid JSON format. Please check your syntax.", ""
+        except Exception as e:
+            return f"❌ Error applying mapping: {str(e)}", ""
+
+    def get_mapped_speaker(self, speaker_label: str) -> str:
+        """Get the mapped role name for a speaker label if it exists."""
+        if speaker_label in self.role_mapping:
+            return self.role_mapping[speaker_label]
+        return speaker_label
+
     def list_audio_devices(self) -> str:
         """
         List available audio input devices.
@@ -567,6 +623,7 @@ class LiveMeetingApp:
             return result
         except Exception as e:
             return f"❌ Error listing devices: {str(e)}"
+
 
 
 def create_gradio_interface():
@@ -798,6 +855,37 @@ def create_gradio_interface():
                     value="Upload a video to begin...",
                     interactive=False,
                     lines=6
+                )
+            
+            # Tab 3: Role Mapping
+            with gr.Tab("👥 Role Mapping"):
+                gr.Markdown("### 🗺️ Map Speakers to Roles")
+                gr.Markdown("Assign professional titles to speaker IDs (e.g., SPEAKER_01) and generate their semantic embeddings.")
+                
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        mapping_input = gr.Code(
+                            language="json",
+                            label="Speaker Mapping (JSON)",
+                            value='{\n  "SPEAKER_00": "Developer",\n  "SPEAKER_01": "Product Manager",\n  "SPEAKER_02": "Designer"\n}',
+                            lines=10
+                        )
+                        
+                        apply_map_btn = gr.Button("🔄 Apply Mapping & Generate Embeddings", variant="primary")
+                        
+                    with gr.Column(scale=1):
+                        mapping_status = gr.Textbox(label="Status", lines=2)
+                        embedding_display = gr.Textbox(
+                            label="Generated Embeddings", 
+                            lines=15,
+                            interactive=False,
+                            info="Dense vector representations of the roles"
+                        )
+                
+                apply_map_btn.click(
+                    fn=app.apply_role_mapping,
+                    inputs=[mapping_input],
+                    outputs=[mapping_status, embedding_display]
                 )
             
             with gr.Column(scale=2):

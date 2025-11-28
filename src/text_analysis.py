@@ -1,7 +1,8 @@
 import logging
 from typing import Dict, List, Any, Optional
 import torch
-from transformers import pipeline
+from transformers import pipeline, AutoTokenizer, AutoModel
+import torch.nn.functional as F
 import numpy as np
 from scipy.spatial.distance import cosine
 
@@ -33,6 +34,25 @@ class TextAnalyzer:
                 model="distilbert-base-uncased-finetuned-sst-2-english",
                 device=self.device
             )
+            
+            # Load sentence embedding model (all-MiniLM-L6-v2)
+            # We load this manually to have full control over pooling and normalization
+            print("Loading sentence embedding model...")
+            self.embedding_tokenizer = AutoTokenizer.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+            self.embedding_model = AutoModel.from_pretrained("sentence-transformers/all-MiniLM-L6-v2")
+            
+            # Move model to device
+            if self.device != -1:
+                # If device is an integer (GPU index), we need to handle it
+                # For simplicity in this manual loading, let's stick to CPU or handle CUDA/MPS if needed
+                # But since we are using 'device' which might be an int from pipeline logic, let's be careful.
+                # The pipeline uses device IDs, but .to() expects device objects or strings.
+                
+                if torch.cuda.is_available():
+                    self.embedding_model = self.embedding_model.to("cuda")
+                elif torch.backends.mps.is_available():
+                    self.embedding_model = self.embedding_model.to("mps")
+            
             self.is_ready = True
         except Exception as e:
             print(f"Error initializing TextAnalyzer: {e}")
@@ -53,27 +73,35 @@ class TextAnalyzer:
             return None
             
         try:
-            # Access the underlying model and tokenizer from the sentiment pipeline
-            model = self.sentiment_pipeline.model
-            tokenizer = self.sentiment_pipeline.tokenizer
+            # Use the dedicated embedding model
+            tokenizer = self.embedding_tokenizer
+            model = self.embedding_model
             
-            # Tokenize and encode
+            # Tokenize
             inputs = tokenizer(text, return_tensors="pt", padding=True, truncation=True, max_length=512)
             
-            # Move inputs to the same device as the model
-            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+            # Move inputs to device
+            if next(model.parameters()).device.type != 'cpu':
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
             
-            # Get model output with hidden states
+            # Get model output
             with torch.no_grad():
-                outputs = model(**inputs, output_hidden_states=True)
+                outputs = model(**inputs)
             
-            # Extract the [CLS] token embedding (first token of the last hidden state)
-            # outputs.hidden_states is a tuple of (embeddings, layer_1, ..., layer_N)
-            # We want the last layer: outputs.hidden_states[-1]
-            last_hidden_state = outputs.hidden_states[-1]
-            cls_embedding = last_hidden_state[0, 0, :].cpu().numpy()
+            # Mean Pooling - Take attention mask into account for correct averaging
+            token_embeddings = outputs.last_hidden_state
+            attention_mask = inputs['attention_mask']
             
-            return cls_embedding
+            input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
+            sum_embeddings = torch.sum(token_embeddings * input_mask_expanded, 1)
+            sum_mask = torch.clamp(input_mask_expanded.sum(1), min=1e-9)
+            mean_pooled = sum_embeddings / sum_mask
+            
+            # Normalize embeddings
+            normalized_embeddings = F.normalize(mean_pooled, p=2, dim=1)
+            
+            # Convert to numpy
+            return normalized_embeddings[0].cpu().numpy()
             
         except Exception as e:
             print(f"Error extracting embedding for '{text[:20]}...': {e}")
@@ -157,12 +185,15 @@ class RoleBasedHighlightScorer:
         
         # Define semantic descriptions for each role
         self.role_descriptions = {
-            "Developer": "Technical discussion about software engineering, code implementation, bugs, API design, databases, servers, deployment, and infrastructure.",
-            "Product Manager": "Discussion about product features, user requirements, roadmap planning, timelines, customer needs, business goals, and prioritization.",
-            "Designer": "Discussion about user interface (UI), user experience (UX), visual design, layouts, prototypes, accessibility, and user flow.",
-            "QA Engineer": "Discussion about testing strategies, bug reporting, quality assurance, automation, test cases, and verifying fixes.",
-            "Scrum Master": "Discussion about agile processes, sprint planning, standups, blockers, team velocity, and project management overhead."
+            "Developer": "Technical details about code, APIs, databases, bugs, latency, servers, deployment, git, refactoring, and software architecture.",
+            "Product Manager": "Product strategy, user requirements, roadmap, KPIs, launch dates, customer feedback, market analysis, and feature prioritization.",
+            "Designer": "User interface visuals, color palettes, typography, layout, user experience flows, prototypes, wireframes, and design consistency.",
+            "QA Engineer": "Testing procedures, bug reproduction, test cases, automation scripts, regression testing, and quality verification.",
+            "Scrum Master": "Agile ceremonies, sprint velocity, blockers, standups, retrospectives, team capacity, and process improvements."
         }
+        
+        # Generic description for filtering
+        self.generic_description = "General meeting pleasantries, scheduling, administrative tasks, greetings, farewells, small talk, and vague project management statements like 'let's get started' or 'thanks for joining'."
         
         # Cache for role embeddings
         self.role_embeddings = {}
@@ -184,6 +215,20 @@ class RoleBasedHighlightScorer:
             self.role_embeddings[role] = embedding
             
         return embedding
+
+    def _get_generic_embedding(self) -> Optional[np.ndarray]:
+        """Get or compute embedding for the generic description."""
+        if "Generic" in self.role_embeddings:
+            return self.role_embeddings["Generic"]
+            
+        if not self.text_analyzer:
+            return None
+            
+        embedding = self.text_analyzer.get_embedding(self.generic_description)
+        if embedding is not None:
+            self.role_embeddings["Generic"] = embedding
+            
+        return embedding
         
     def score_sentence(self, sentence: str, role: str) -> float:
         """
@@ -203,9 +248,22 @@ class RoleBasedHighlightScorer:
         # Compute Cosine Similarity
         # 1 - cosine_distance = cosine_similarity
         # Range: [-1, 1], where 1 is identical
-        similarity = 1 - cosine(role_emb, sent_emb)
+        role_similarity = 1 - cosine(role_emb, sent_emb)
         
-        return float(similarity)
+        # Check against Generic role
+        generic_emb = self._get_generic_embedding()
+        if generic_emb is not None:
+            generic_similarity = 1 - cosine(generic_emb, sent_emb)
+            
+            # If the sentence is more generic than specific to the role, penalize heavily
+            if generic_similarity > role_similarity:
+                return 0.0
+            
+            # Or if it's just very generic (high generic score), penalize
+            if generic_similarity > 0.4:
+                role_similarity -= (generic_similarity * 0.5)
+        
+        return float(role_similarity)
         
     def extract_highlights(self, text: str, role: str, top_n: int = 3) -> List[str]:
         """
@@ -220,8 +278,8 @@ class RoleBasedHighlightScorer:
         scored_sentences = []
         for sentence in sentences:
             score = self.score_sentence(sentence, role)
-            # Filter out low relevance (e.g., < 0.15) to avoid noise
-            if score > 0.15:
+            # Filter out low relevance (increased threshold to 0.25)
+            if score > 0.25:
                 scored_sentences.append((score, sentence))
                 
         # Sort by score descending
