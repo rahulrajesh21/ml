@@ -16,6 +16,10 @@ faster-whisper>=1.0.0
 whisperx>=3.0.0  # Optional: Advanced transcription with diarization
 openai>=1.0.0
 
+# Text Analysis
+transformers>=4.30.0
+torch>=2.0.0
+
 # Note: WhisperX requires additional system dependencies:
 # - CUDA 12.8 (for GPU support)
 # - ffmpeg

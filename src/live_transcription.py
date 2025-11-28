@@ -8,7 +8,7 @@ import sys
 import tempfile
 import threading
 import queue
-from typing import Optional, Callable, Literal
+from typing import Optional, Callable, Literal, Iterator
 import time
 import numpy as np
 
@@ -331,6 +331,140 @@ class LiveTranscriber:
             # Clean up temp file
             if os.path.exists(temp_path):
                 os.remove(temp_path)
+    
+    def transcribe_full_audio(self, audio_data, sample_rate: int = 16000) -> Iterator[dict]:
+        """
+        Transcribe full audio and yield segments with timestamps.
+        
+        Args:
+            audio_data: Audio data as bytes or numpy array
+            sample_rate: Audio sample rate
+            
+        Yields:
+            Dictionary with 'start', 'end', 'text', 'speaker' (optional)
+        """
+        # Convert to float32 array if needed
+        if isinstance(audio_data, bytes):
+            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        elif isinstance(audio_data, np.ndarray):
+            if audio_data.dtype != np.float32:
+                audio_array = audio_data.astype(np.float32)
+            else:
+                audio_array = audio_data
+            if audio_array.max() > 1.0 or audio_array.min() < -1.0:
+                audio_array = np.clip(audio_array, -1.0, 1.0)
+        else:
+            raise TypeError(f"audio_data must be bytes or numpy array, got {type(audio_data)}")
+            
+        segments_data = []
+        
+        if self.model_type == "whisperx":
+            # Transcribe with WhisperX
+            result = self.model.transcribe(
+                audio_array,
+                batch_size=16,
+                language=self.language
+            )
+            
+            # Align
+            if result["segments"]:
+                try:
+                    model_a, metadata = whisperx.load_align_model(
+                        language_code=result.get("language", self.language or "en"),
+                        device=self.device
+                    )
+                    result = whisperx.align(
+                        result["segments"],
+                        model_a,
+                        metadata,
+                        audio_array,
+                        self.device,
+                        return_char_alignments=False
+                    )
+                except Exception as e:
+                    print(f"Warning: Alignment failed: {e}")
+            
+            # Diarize
+            if self.enable_diarization and self.diarize_model and result["segments"]:
+                try:
+                    diarize_segments = self.diarize_model(audio_array)
+                    result = whisperx.assign_word_speakers(diarize_segments, result)
+                except Exception as e:
+                    print(f"Warning: Diarization failed: {e}")
+            
+            # Format segments
+            for segment in result.get("segments", []):
+                yield {
+                    "start": segment.get("start", 0),
+                    "end": segment.get("end", 0),
+                    "text": segment.get("text", "").strip(),
+                    "speaker": segment.get("speaker", None)
+                }
+                
+        elif self.model_type == "faster-whisper":
+            # Transcribe with faster-whisper
+            segments, info = self.model.transcribe(
+                audio_array,
+                language=self.language,
+                beam_size=5,
+                vad_filter=True
+            )
+            
+            for segment in segments:
+                yield {
+                    "start": segment.start,
+                    "end": segment.end,
+                    "text": segment.text.strip(),
+                    "speaker": None
+                }
+                
+        elif self.model_type == "openai":
+            # OpenAI doesn't give word-level timestamps easily with the simple API, 
+            # but we can get segment-level if we use verbose_json.
+            # For now, let's just do the simple transcription and treat it as one big segment
+            # or implement a split if needed. 
+            # Actually, let's try to use verbose_json to get segments.
+            
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                temp_path = temp_file.name
+                import wave
+                with wave.open(temp_path, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(sample_rate)
+                    # Convert back to int16 for WAV
+                    audio_int16 = (audio_array * 32767).astype(np.int16)
+                    wf.writeframes(audio_int16.tobytes())
+            
+            try:
+                with open(temp_path, 'rb') as audio_file:
+                    response = self.client.audio.transcriptions.create(
+                        model="whisper-1",
+                        file=audio_file,
+                        language=self.language,
+                        response_format="verbose_json"
+                    )
+                
+                # response should have 'segments'
+                if hasattr(response, 'segments'):
+                    for segment in response.segments:
+                        yield {
+                            "start": segment['start'],
+                            "end": segment['end'],
+                            "text": segment['text'].strip(),
+                            "speaker": None
+                        }
+                else:
+                    # Fallback
+                    yield {
+                        "start": 0,
+                        "end": response.duration,
+                        "text": response.text.strip(),
+                        "speaker": None
+                    }
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
     
     def start_live_transcription(
         self,
