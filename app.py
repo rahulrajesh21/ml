@@ -550,17 +550,19 @@ class LiveMeetingApp:
 
 
 
-    def apply_role_mapping(self, json_str: str) -> tuple[str, str]:
+    def apply_role_mapping(self, json_str: str, current_transcript: str = "") -> tuple[str, str, str]:
         """
-        Parse JSON mapping and generate embeddings for roles.
+        Parse JSON mapping, generate embeddings, and update transcript with role names.
         """
+        updated_transcript = current_transcript
+        
         if not json_str or not json_str.strip():
-            return "⚠️ Please enter a JSON mapping.", ""
+            return "⚠️ Please enter a JSON mapping.", "", updated_transcript
             
         try:
             mapping = json.loads(json_str)
             if not isinstance(mapping, dict):
-                return "❌ Invalid format. Expected a JSON object (dictionary).", ""
+                return "❌ Invalid format. Expected a JSON object (dictionary).", "", updated_transcript
             
             self.role_mapping = mapping
             self.role_embeddings = {}
@@ -570,7 +572,7 @@ class LiveMeetingApp:
                 try:
                     self.text_analyzer = TextAnalyzer(device=self.device)
                 except Exception as e:
-                    return f"❌ Error initializing Text Analyzer: {str(e)}", ""
+                    return f"❌ Error initializing Text Analyzer: {str(e)}", "", updated_transcript
             
             # Generate embeddings
             embedding_info = "✅ Mapping Applied & Embeddings Generated:\n\n"
@@ -586,18 +588,75 @@ class LiveMeetingApp:
                 else:
                     embedding_info += f"🔸 {speaker_id} ➔ {role} (Embedding failed)\n\n"
             
-            return "✅ Role mapping applied successfully!", embedding_info
+            # Update transcript text if available
+            if updated_transcript:
+                for speaker_id, role in mapping.items():
+                    # Replace [SPEAKER_XX] with [Role]
+                    # Simple string replace is safe enough for this format
+                    updated_transcript = updated_transcript.replace(f"[{speaker_id}]", f"[{role}]")
+                
+                # Update internal state
+                self.transcript_text = updated_transcript
+            
+            return "✅ Role mapping applied successfully!", embedding_info, updated_transcript
             
         except json.JSONDecodeError:
-            return "❌ Invalid JSON format. Please check your syntax.", ""
+            return "❌ Invalid JSON format. Please check your syntax.", "", updated_transcript
         except Exception as e:
-            return f"❌ Error applying mapping: {str(e)}", ""
+            return f"❌ Error applying mapping: {str(e)}", "", updated_transcript
 
     def get_mapped_speaker(self, speaker_label: str) -> str:
         """Get the mapped role name for a speaker label if it exists."""
         if speaker_label in self.role_mapping:
             return self.role_mapping[speaker_label]
+        if speaker_label in self.role_mapping:
+            return self.role_mapping[speaker_label]
         return speaker_label
+
+    def generate_mapped_highlights(self, video_transcript: str, manual_transcript: str = "") -> str:
+        """
+        Generate highlights for all roles currently in the mapping.
+        Prioritizes manual transcript if provided.
+        """
+        # Determine which text to use
+        transcript_text = manual_transcript if manual_transcript and manual_transcript.strip() else video_transcript
+        
+        # Ensure mapping is applied to the text before analysis
+        # This is critical for strict speaker filtering to work
+        if self.role_mapping and transcript_text:
+            for speaker_id, role in self.role_mapping.items():
+                transcript_text = transcript_text.replace(f"[{speaker_id}]", f"[{role}]")
+        
+        if not self.role_mapping:
+            return "⚠️ No roles mapped yet. Please apply a mapping first."
+            
+        if not transcript_text or not transcript_text.strip():
+            return "⚠️ No transcript available to analyze. Please upload a video or paste a transcript."
+            
+        # Lazy init
+        if not self.highlight_scorer:
+            if not self.text_analyzer:
+                try:
+                    self.text_analyzer = TextAnalyzer(device=self.device)
+                except Exception as e:
+                    return f"❌ Error initializing analyzer: {str(e)}"
+            self.highlight_scorer = RoleBasedHighlightScorer(text_analyzer=self.text_analyzer)
+            
+        # Get unique roles
+        unique_roles = list(set(self.role_mapping.values()))
+        
+        full_output = ""
+        
+        for role in unique_roles:
+            highlights = self.highlight_scorer.extract_highlights(transcript_text, role)
+            if highlights:
+                full_output += f"### ✨ Highlights for {role}\n\n"
+                for i, h in enumerate(highlights, 1):
+                    full_output += f"**{i}.** {h}\n\n"
+            else:
+                full_output += f"### ✨ Highlights for {role}\n*(No specific highlights found)*\n\n"
+                
+        return full_output
 
     def list_audio_devices(self) -> str:
         """
@@ -882,11 +941,22 @@ def create_gradio_interface():
                             info="Dense vector representations of the roles"
                         )
                 
-                apply_map_btn.click(
-                    fn=app.apply_role_mapping,
-                    inputs=[mapping_input],
-                    outputs=[mapping_status, embedding_display]
+                apply_map_btn = gr.Button("🔄 Apply Mapping & Generate Embeddings", variant="primary")
+
+                
+                gr.Markdown("---")
+                gr.Markdown("### ✨ Generate Role-Based Highlights")
+                
+                manual_transcript_input = gr.Textbox(
+                    label="📝 Paste Transcript (Optional)",
+                    placeholder="Paste your transcript here to analyze it directly (overrides video transcript)...",
+                    lines=10
                 )
+                
+                generate_mapped_btn = gr.Button("✨ Generate Highlights for Mapped Roles", size="lg")
+                mapped_highlights_box = gr.Textbox(label="Mapped Highlights", lines=10)
+                
+
             
             with gr.Column(scale=2):
                 gr.Markdown("### 📝 Video Transcript")
@@ -1027,6 +1097,20 @@ def create_gradio_interface():
             fn=app.export_transcript,
             inputs=[export_format],
             outputs=[export_file]
+        )
+        
+        # Event handlers - Mapped Highlights
+        generate_mapped_btn.click(
+            fn=app.generate_mapped_highlights,
+            inputs=[video_transcript_box, manual_transcript_input],
+            outputs=[mapped_highlights_box]
+        )
+        
+        # Event handlers - Apply Mapping (Moved here to access video_transcript_box)
+        apply_map_btn.click(
+            fn=app.apply_role_mapping,
+            inputs=[mapping_input, video_transcript_box],
+            outputs=[mapping_status, embedding_display, video_transcript_box]
         )
         
         gr.Markdown(

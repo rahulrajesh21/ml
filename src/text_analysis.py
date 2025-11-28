@@ -206,9 +206,13 @@ class RoleBasedHighlightScorer:
         if not self.text_analyzer:
             return None
             
-        description = self.role_descriptions.get(role, "")
+        description = self.role_descriptions.get(role)
+        
+        # If no pre-defined description, use the role name itself as the semantic query
         if not description:
-            return None
+            # We can enhance this by adding some context
+            # e.g. "Discussion relevant to [Role]"
+            description = f"Discussion relevant to {role}, including responsibilities, tasks, and updates related to {role}."
             
         embedding = self.text_analyzer.get_embedding(description)
         if embedding is not None:
@@ -268,17 +272,56 @@ class RoleBasedHighlightScorer:
     def extract_highlights(self, text: str, role: str, top_n: int = 3) -> List[str]:
         """
         Extract the top N most relevant sentences for a given role.
+        Strictly filters for sentences spoken by the role if speaker tags are present.
         """
         if not text or not self.text_analyzer:
             return []
             
-        # Split text into sentences
-        sentences = [s.strip() for s in text.replace("?", ".").replace("!", ".").split(".") if s.strip()]
-        
         scored_sentences = []
-        for sentence in sentences:
+        
+        # Split into lines to preserve speaker context
+        lines = text.split('\n')
+        
+        import re
+        # Regex to extract speaker: [Timestamp] [Speaker] Text
+        # Matches: [10:00:00] [Developer] Some text.
+        line_pattern = re.compile(r"\[.*?\] \[(.*?)\] (.*)")
+        
+        role_sentences = []
+        all_sentences = []
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+                
+            match = line_pattern.match(line)
+            current_speaker = None
+            content = line
+            
+            if match:
+                current_speaker = match.group(1)
+                content = match.group(2)
+            
+            # Split content into sentences
+            sentences = [s.strip() for s in content.replace("?", ".").replace("!", ".").split(".") if s.strip()]
+            
+            for sentence in sentences:
+                all_sentences.append(sentence)
+                # Check if this sentence was spoken by the target role
+                if current_speaker and role.lower() in current_speaker.lower():
+                    role_sentences.append(sentence)
+        
+        # DECISION: If we found sentences spoken by the role, ONLY analyze those.
+        # This creates a strict summary of what THEY said.
+        # If not (maybe role name mismatch), fall back to analyzing everything.
+        target_pool = role_sentences if role_sentences else all_sentences
+        
+        for sentence in target_pool:
+            # Base semantic score
             score = self.score_sentence(sentence, role)
-            # Filter out low relevance (increased threshold to 0.25)
+            
+            # Filter out low relevance (threshold 0.25)
             if score > 0.25:
                 scored_sentences.append((score, sentence))
                 
@@ -286,5 +329,15 @@ class RoleBasedHighlightScorer:
         scored_sentences.sort(key=lambda x: x[0], reverse=True)
         
         # Return top N sentences
-        return [s[1] for s in scored_sentences[:top_n]]
+        # Remove duplicates while preserving order
+        seen = set()
+        unique_highlights = []
+        for s in scored_sentences:
+            if s[1] not in seen:
+                unique_highlights.append(s[1])
+                seen.add(s[1])
+                if len(unique_highlights) >= top_n:
+                    break
+                    
+        return unique_highlights
 
