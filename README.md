@@ -8,6 +8,7 @@ A real-time transcription system for meetings, lectures, and conversations using
 - **Video Simulation**: Upload video files and simulate meeting transcription
 - **Multiple Model Support**: 
   - Local transcription with faster-whisper (free, offline)
+  - Advanced transcription with WhisperX (70x faster, word-level timestamps, speaker diarization)
   - Cloud transcription with OpenAI Whisper API
 - **Flexible Model Sizes**: Choose from tiny to large-v3 based on accuracy/speed needs
 - **Multi-language Support**: Supports 12+ languages including English, Spanish, French, German, etc.
@@ -88,13 +89,23 @@ python3 app.py
 
 ## 🎯 Model Selection Guide
 
+### Model Comparison
+
+| Model Type | Speed | Accuracy | Features | Memory | Internet |
+|------------|-------|----------|----------|---------|----------|
+| **faster-whisper** | ⚡⚡⚡⚡ | ⭐⭐⭐⭐ | Fast, reliable | ~1-10 GB | First run only |
+| **WhisperX** | ⚡⚡⚡⚡⚡ | ⭐⭐⭐⭐⭐ | 70x faster, word timestamps, diarization | ~2-12 GB | First run only |
+| **OpenAI API** | ⚡⚡⚡ | ⭐⭐⭐⭐⭐ | Cloud-based | Minimal | Always required |
+
+### Model Sizes
+
 | Model Size | Speed | Accuracy | Use Case | Memory |
 |------------|-------|----------|----------|---------|
 | tiny | ⚡⚡⚡⚡⚡ | ⭐⭐ | Quick notes, testing | ~1 GB |
 | base | ⚡⚡⚡⚡ | ⭐⭐⭐ | Real-time meetings | ~1 GB |
 | small | ⚡⚡⚡ | ⭐⭐⭐⭐ | Professional meetings | ~2 GB |
 | medium | ⚡⚡ | ⭐⭐⭐⭐⭐ | Important recordings | ~5 GB |
-| large-v3 | ⚡ | ⭐⭐⭐⭐⭐ | Critical transcription | ~10 GB |
+| large-v2/v3 | ⚡ | ⭐⭐⭐⭐⭐ | Critical transcription | ~10 GB |
 
 ## 📁 Project Structure
 
@@ -133,6 +144,27 @@ For faster processing with GPU:
    pip install faster-whisper[gpu]
    ```
 3. Select "cuda" as the device in the web interface
+
+### Using WhisperX (Advanced)
+
+WhisperX provides 70x realtime speed, word-level timestamps, and speaker diarization:
+
+1. **Install WhisperX**:
+   ```bash
+   pip install whisperx
+   ```
+
+2. **For Speaker Diarization**:
+   - Get HuggingFace token from [here](https://huggingface.co/settings/tokens)
+   - Accept user agreements for:
+     - [pyannote/segmentation-3.0](https://huggingface.co/pyannote/segmentation-3.0)
+     - [pyannote/speaker-diarization-3.1](https://huggingface.co/pyannote/speaker-diarization-3.1)
+   - Set environment variable:
+     ```bash
+     export HF_TOKEN='your-huggingface-token'
+     ```
+
+3. **Select "whisperx" in the UI** and optionally enable diarization for speaker labels
 
 ## 💡 Tips for Best Results
 

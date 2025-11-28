@@ -2,6 +2,9 @@
 numpy>=1.24.0,<2.0.0
 gradio>=4.40.0,<5.0.0
 
+# Environment variables
+python-dotenv>=1.0.0
+
 # Audio processing (requires portaudio system package)
 PyAudio>=0.2.14
 
@@ -10,7 +13,14 @@ moviepy>=2.0.0
 
 # Transcription engines
 faster-whisper>=1.0.0
+whisperx>=3.0.0  # Optional: Advanced transcription with diarization
 openai>=1.0.0
+
+# Note: WhisperX requires additional system dependencies:
+# - CUDA 12.8 (for GPU support)
+# - ffmpeg
+# Install: pip install whisperx
+# For diarization, accept HF model agreements and set HF_TOKEN
 
 # Note: System requirements
 # - macOS: brew install portaudio ffmpeg

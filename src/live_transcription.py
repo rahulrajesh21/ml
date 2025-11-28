@@ -30,6 +30,15 @@ try:
 except ImportError:
     OPENAI_AVAILABLE = False
 
+# Try to import WhisperX for enhanced transcription with diarization
+try:
+    import whisperx
+    from whisperx.diarize import DiarizationPipeline
+    WHISPERX_AVAILABLE = True
+except ImportError:
+    WHISPERX_AVAILABLE = False
+    print("Warning: whisperx not available. Install with: pip install whisperx")
+
 from audio_capture import AudioCapture, AudioBuffer
 
 
@@ -40,31 +49,84 @@ class LiveTranscriber:
     
     def __init__(
         self,
-        model_type: Literal["faster-whisper", "openai"] = "faster-whisper",
+        model_type: Literal["faster-whisper", "openai", "whisperx"] = "faster-whisper",
         model_size: str = "base",
         language: Optional[str] = None,
         openai_api_key: Optional[str] = None,
+        hf_token: Optional[str] = None,
         device: str = "cpu",
-        compute_type: str = "int8"
+        compute_type: str = "int8",
+        enable_diarization: bool = False
     ):
         """
         Initialize the live transcriber.
         
         Args:
-            model_type: Type of model to use ("faster-whisper" or "openai")
-            model_size: Model size for faster-whisper (tiny, base, small, medium, large-v3)
+            model_type: Type of model to use ("faster-whisper", "openai", or "whisperx")
+            model_size: Model size for faster-whisper/whisperx (tiny, base, small, medium, large-v2, large-v3)
             language: Optional language code (e.g., "en", "es", "fr")
             openai_api_key: OpenAI API key (required if using openai model)
+            hf_token: Hugging Face token (required for WhisperX diarization)
             device: Device to run on ("cpu" or "cuda")
-            compute_type: Compute type for faster-whisper ("int8", "float16", "float32")
+            compute_type: Compute type for faster-whisper/whisperx ("int8", "float16", "float32")
+            enable_diarization: Enable speaker diarization (WhisperX only)
         """
         self.model_type = model_type
         self.model_size = model_size
         self.language = language
         self.device = device
+        self.enable_diarization = enable_diarization
+        self.hf_token = hf_token
+        self.diarize_model = None
+        
+        # Validate device compatibility
+        if device == "mps" and model_type == "faster-whisper":
+            raise ValueError(
+                "faster-whisper does not support MPS (Apple Metal).\n\n"
+                "To use Apple Silicon GPU acceleration:\n"
+                "1. Select 'whisperx' as the Model Type\n"
+                "2. Select 'mps' as the Device\n\n"
+                "Alternatively, use 'cpu' device with faster-whisper."
+            )
         
         # Initialize model based on type
-        if model_type == "faster-whisper":
+        if model_type == "whisperx":
+            if not WHISPERX_AVAILABLE:
+                raise ImportError(
+                    "WhisperX is not installed.\n\n"
+                    "To install WhisperX:\n"
+                    "1. Activate your virtual environment\n"
+                    "2. Run: pip install whisperx\n"
+                    "3. For GPU support: Install CUDA 12.8\n"
+                    "4. For speaker diarization: Set HF_TOKEN environment variable\n\n"
+                    "See WHISPERX_SETUP.md for detailed instructions."
+                )
+            
+            print(f"Loading WhisperX model: {model_size}...")
+            self.model = whisperx.load_model(
+                model_size,
+                device=device,
+                compute_type=compute_type
+            )
+            print("WhisperX model loaded successfully!")
+            
+            # Initialize diarization if enabled
+            if enable_diarization:
+                if not hf_token:
+                    hf_token = os.getenv("HF_TOKEN")
+                    if not hf_token:
+                        print("Warning: Diarization requires HF_TOKEN. Set environment variable or pass hf_token parameter.")
+                        self.enable_diarization = False
+                    else:
+                        print("Initializing speaker diarization...")
+                        self.diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+                        print("Diarization pipeline loaded!")
+                else:
+                    print("Initializing speaker diarization...")
+                    self.diarize_model = DiarizationPipeline(use_auth_token=hf_token, device=device)
+                    print("Diarization pipeline loaded!")
+            
+        elif model_type == "faster-whisper":
             if not FASTER_WHISPER_AVAILABLE:
                 raise ImportError("faster-whisper is not installed. Install with: pip install faster-whisper")
             
@@ -108,10 +170,90 @@ class LiveTranscriber:
         Returns:
             Transcribed text
         """
-        if self.model_type == "faster-whisper":
+        if self.model_type == "whisperx":
+            return self._transcribe_with_whisperx(audio_data, sample_rate)
+        elif self.model_type == "faster-whisper":
             return self._transcribe_with_faster_whisper(audio_data, sample_rate)
         elif self.model_type == "openai":
             return self._transcribe_with_openai(audio_data, sample_rate)
+    
+    def _transcribe_with_whisperx(self, audio_data, sample_rate: int) -> str:
+        """
+        Transcribe using WhisperX (local model with optional diarization).
+        
+        Args:
+            audio_data: Audio data as bytes or numpy array (float32)
+            sample_rate: Audio sample rate
+            
+        Returns:
+            Transcribed text with optional speaker labels
+        """
+        # Convert to float32 array if needed
+        if isinstance(audio_data, bytes):
+            audio_array = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+        elif isinstance(audio_data, np.ndarray):
+            if audio_data.dtype != np.float32:
+                audio_array = audio_data.astype(np.float32)
+            else:
+                audio_array = audio_data
+            if audio_array.max() > 1.0 or audio_array.min() < -1.0:
+                audio_array = np.clip(audio_array, -1.0, 1.0)
+        else:
+            raise TypeError(f"audio_data must be bytes or numpy array, got {type(audio_data)}")
+        
+        # Transcribe with WhisperX
+        result = self.model.transcribe(
+            audio_array,
+            batch_size=16,
+            language=self.language
+        )
+        
+        # Apply alignment for word-level timestamps
+        if result["segments"]:
+            try:
+                model_a, metadata = whisperx.load_align_model(
+                    language_code=result.get("language", self.language or "en"),
+                    device=self.device
+                )
+                result = whisperx.align(
+                    result["segments"],
+                    model_a,
+                    metadata,
+                    audio_array,
+                    self.device,
+                    return_char_alignments=False
+                )
+            except Exception as e:
+                print(f"Warning: Alignment failed: {e}")
+        
+        # Apply diarization if enabled
+        if self.enable_diarization and self.diarize_model and result["segments"]:
+            try:
+                diarize_segments = self.diarize_model(audio_array)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
+                
+                # Debug: Count unique speakers detected
+                speakers = set()
+                for segment in result.get("segments", []):
+                    if "speaker" in segment:
+                        speakers.add(segment["speaker"])
+                if speakers:
+                    print(f"Diarization detected {len(speakers)} speaker(s): {sorted(speakers)}")
+                    
+            except Exception as e:
+                print(f"Warning: Diarization failed: {e}")
+        
+        # Format output text
+        text_parts = []
+        for segment in result.get("segments", []):
+            speaker = segment.get("speaker", "")
+            text = segment.get("text", "").strip()
+            if speaker:
+                text_parts.append(f"[{speaker}] {text}")
+            else:
+                text_parts.append(text)
+        
+        return " ".join(text_parts).strip()
     
     def _transcribe_with_faster_whisper(self, audio_data, sample_rate: int) -> str:
         """

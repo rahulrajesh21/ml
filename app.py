@@ -13,6 +13,10 @@ import json
 from datetime import datetime
 import subprocess
 import numpy as np
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Add src to path
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
@@ -41,7 +45,8 @@ class LiveMeetingApp:
         model_type: str,
         model_size: str,
         language: str,
-        device: str
+        device: str,
+        enable_diarization: bool = False
     ):
         """
         Initialize audio capture and transcriber components.
@@ -71,13 +76,25 @@ class LiveMeetingApp:
         if model_type == "openai":
             openai_api_key = os.getenv("OPENAI_API_KEY")
         
-        # Initialize transcriber
+        # Get HuggingFace token for WhisperX diarization
+        hf_token = None
+        if model_type == "whisperx":
+            hf_token = os.getenv("HF_TOKEN")
+        
+        # Initialize transcriber with appropriate model size
+        # OpenAI uses "whisper-1", WhisperX and faster-whisper use the selected size
+        actual_model_size = model_size
+        if model_type == "openai":
+            actual_model_size = "whisper-1"
+        
         self.transcriber = LiveTranscriber(
             model_type=model_type,
-            model_size=model_size if model_type == "faster-whisper" else "whisper-1",
+            model_size=actual_model_size,
             language=language if language != "auto" else None,
             openai_api_key=openai_api_key,
-            device=device
+            hf_token=hf_token,
+            device=device,
+            enable_diarization=enable_diarization
         )
         
     def start_recording(
@@ -85,7 +102,8 @@ class LiveMeetingApp:
         model_type: str,
         model_size: str,
         language: str,
-        device: str
+        device: str,
+        enable_diarization: bool = False
     ) -> tuple[str, str]:
         """
         Start live transcription.
@@ -98,7 +116,7 @@ class LiveMeetingApp:
         
         try:
             # Initialize components
-            self.initialize_components(model_type, model_size, language, device)
+            self.initialize_components(model_type, model_size, language, device, enable_diarization)
             
             # Clear previous transcript
             self.transcript_text = ""
@@ -271,7 +289,8 @@ class LiveMeetingApp:
         model_size: str,
         language: str,
         device: str,
-        speed_multiplier: float
+        speed_multiplier: float = 1.0,
+        enable_diarization: bool = False
     ) -> tuple[str, str]:
         """
         Start video simulation mode - transcribe video audio in chunks.
@@ -298,12 +317,24 @@ class LiveMeetingApp:
             if model_type == "openai":
                 openai_api_key = os.getenv("OPENAI_API_KEY")
             
+            # Get HuggingFace token for WhisperX diarization
+            hf_token = None
+            if model_type == "whisperx":
+                hf_token = os.getenv("HF_TOKEN")
+            
+            # Set appropriate model size based on model type
+            actual_model_size = model_size
+            if model_type == "openai":
+                actual_model_size = "whisper-1"
+            
             self.transcriber = LiveTranscriber(
                 model_type=model_type,
-                model_size=model_size if model_type == "faster-whisper" else "whisper-1",
+                model_size=actual_model_size,
                 language=language if language != "auto" else None,
                 openai_api_key=openai_api_key,
-                device=device
+                hf_token=hf_token,
+                device=device,
+                enable_diarization=enable_diarization
             )
             
             # Clear previous transcript
@@ -347,9 +378,25 @@ class LiveMeetingApp:
                 self.is_simulating = False
                 return
             
-            # Get audio properties
-            chunk_duration = 3.0  # 3 second chunks
             total_duration = video.duration
+            
+            # If diarization is enabled, run it on the full audio first for consistent speaker labels
+            diarization_result = None
+            if self.transcriber.enable_diarization:
+                print("Extracting full audio for speaker diarization...")
+                diarization_result = self._run_full_diarization(total_duration)
+                if diarization_result:
+                    print(f"Diarization complete. Detected {len(diarization_result.get('speakers', set()))} unique speakers")
+                    # Temporarily disable chunk-level diarization since we'll apply the global one
+                    self.transcriber.enable_diarization = False
+            
+            # Get audio properties
+            # When using full diarization, we can use shorter chunks for faster transcription display
+            # Otherwise use longer chunks for better chunk-level diarization
+            if diarization_result:
+                chunk_duration = 3.0  # Short chunks for responsive display with pre-computed speakers
+            else:
+                chunk_duration = 30.0 if self.transcriber.enable_diarization else 3.0
             
             print(f"Video duration: {total_duration}s, chunk duration: {chunk_duration}s")
             
@@ -398,6 +445,10 @@ class LiveMeetingApp:
                     try:
                         result = self.transcriber.transcribe_chunk(audio_float, 16000)
                         
+                        # If we have pre-computed diarization, apply speaker labels based on time
+                        if diarization_result and result and result.strip():
+                            result = self._apply_diarization_to_text(result, start_time, end_time, diarization_result)
+                        
                         if result and result.strip():
                             timestamp = time.strftime('%H:%M:%S', time.gmtime(start_time))
                             entry = {
@@ -435,6 +486,131 @@ class LiveMeetingApp:
         finally:
             if 'video' in locals():
                 video.close()
+    
+    def _run_full_diarization(self, total_duration: float):
+        """
+        Run diarization on the full audio file to get consistent speaker labels.
+        
+        Args:
+            total_duration: Total duration of the video
+            
+        Returns:
+            Dictionary with diarization segments or None if failed
+        """
+        try:
+            # Extract full audio using ffmpeg
+            target_fps = 16000
+            
+            cmd = [
+                'ffmpeg',
+                '-i', self.video_audio_path,
+                '-vn',
+                '-acodec', 'pcm_s16le',
+                '-ar', str(target_fps),
+                '-ac', '1',
+                '-f', 's16le',
+                '-loglevel', 'error',
+                '-'
+            ]
+            
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True
+            )
+            
+            # Convert to float32 array
+            audio_int16 = np.frombuffer(result.stdout, dtype=np.int16)
+            audio_float = audio_int16.astype(np.float32) / 32768.0
+            
+            # Run diarization using the transcriber's diarization model
+            if hasattr(self.transcriber, 'diarize_model') and self.transcriber.diarize_model:
+                print("Running speaker diarization on full audio...")
+                diarize_segments = self.transcriber.diarize_model(audio_float)
+                
+                # Extract speaker segments with timestamps
+                segments = []
+                speakers = set()
+                
+                for turn, _, speaker in diarize_segments.itertracks(yield_label=True):
+                    segments.append({
+                        'start': turn.start,
+                        'end': turn.end,
+                        'speaker': speaker
+                    })
+                    speakers.add(speaker)
+                
+                print(f"Diarization found {len(speakers)} speakers in {len(segments)} segments")
+                
+                return {
+                    'segments': segments,
+                    'speakers': speakers
+                }
+            
+        except Exception as e:
+            print(f"Warning: Full diarization failed: {e}")
+            return None
+    
+    def _apply_diarization_to_text(self, text: str, start_time: float, end_time: float, diarization_result: dict) -> str:
+        """
+        Apply pre-computed diarization speaker labels to transcribed text.
+        
+        Args:
+            text: Transcribed text (may already have speaker labels from chunk-level diarization)
+            start_time: Start time of the chunk in seconds
+            end_time: End time of the chunk in seconds
+            diarization_result: Pre-computed diarization with segments
+            
+        Returns:
+            Text with corrected speaker labels
+        """
+        if not diarization_result or 'segments' not in diarization_result:
+            return text
+        
+        # Find which speaker(s) were active during this time range
+        active_speakers = []
+        for seg in diarization_result['segments']:
+            # Check if segment overlaps with our chunk
+            if seg['start'] < end_time and seg['end'] > start_time:
+                # Calculate overlap
+                overlap_start = max(seg['start'], start_time)
+                overlap_end = min(seg['end'], end_time)
+                overlap_duration = overlap_end - overlap_start
+                
+                active_speakers.append({
+                    'speaker': seg['speaker'],
+                    'start': overlap_start,
+                    'end': overlap_end,
+                    'duration': overlap_duration
+                })
+        
+        if not active_speakers:
+            return text
+        
+        # If only one speaker, replace all speaker labels with that speaker
+        if len(active_speakers) == 1:
+            speaker = active_speakers[0]['speaker']
+            # Replace any existing speaker labels
+            import re
+            text = re.sub(r'\[SPEAKER_\d+\]', f'[{speaker}]', text)
+            # If no speaker labels exist, add one at the beginning
+            if not re.search(r'\[SPEAKER_\d+\]', text):
+                text = f"[{speaker}] {text}"
+            return text
+        
+        # Multiple speakers - sort by start time and prepend dominant speaker
+        active_speakers.sort(key=lambda x: x['duration'], reverse=True)
+        dominant_speaker = active_speakers[0]['speaker']
+        
+        # Simple approach: label with dominant speaker
+        # (More sophisticated approach would need word-level timestamps)
+        import re
+        text = re.sub(r'\[SPEAKER_\d+\]', f'[{dominant_speaker}]', text)
+        if not re.search(r'\[SPEAKER_\d+\]', text):
+            text = f"[{dominant_speaker}] {text}"
+        
+        return text
     
     def stop_video_simulation(self) -> tuple[str, str]:
         """
@@ -510,16 +686,16 @@ def create_gradio_interface():
                         gr.Markdown("### ⚙️ Configuration")
                         
                         model_type = gr.Radio(
-                            choices=["faster-whisper", "openai"],
+                            choices=["faster-whisper", "whisperx", "openai"],
                             value="faster-whisper",
                             label="🤖 Model Type",
-                            info="faster-whisper runs locally (free), OpenAI uses API (requires key)"
+                            info="faster-whisper: fast & reliable | whisperx: 70x faster + diarization (requires: pip install whisperx) | openai: cloud API"
                         )
                         
                         model_size = gr.Dropdown(
-                            choices=["tiny", "base", "small", "medium", "large-v3"],
+                            choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
                             value="base",
-                            label="📏 Model Size (faster-whisper only)",
+                            label="📏 Model Size",
                             info="Larger = more accurate but slower"
                         )
                         
@@ -531,10 +707,16 @@ def create_gradio_interface():
                         )
                         
                         device = gr.Radio(
-                            choices=["cpu", "cuda"],
+                            choices=["cpu", "cuda", "mps"],
                             value="cpu",
                             label="💻 Device",
-                            info="Use CUDA if you have a compatible NVIDIA GPU"
+                            info="cpu: All models | cuda: All models (NVIDIA GPU) | mps: WhisperX only (Apple M1/M2/M3)"
+                        )
+                        
+                        enable_diarization = gr.Checkbox(
+                            value=False,
+                            label="👥 Enable Speaker Diarization (WhisperX only)",
+                            info="Identifies different speakers (requires HF_TOKEN env variable)"
                         )
                         
                         gr.Markdown("---")
@@ -593,16 +775,16 @@ def create_gradio_interface():
                         gr.Markdown("### ⚙️ Configuration")
                         
                         video_model_type = gr.Radio(
-                            choices=["faster-whisper", "openai"],
+                            choices=["faster-whisper", "whisperx", "openai"],
                             value="faster-whisper",
                             label="🤖 Model Type",
-                            info="faster-whisper runs locally (free), OpenAI uses API (requires key)"
+                            info="faster-whisper: fast & reliable | whisperx: 70x faster + diarization (requires: pip install whisperx) | openai: cloud API"
                         )
                         
                         video_model_size = gr.Dropdown(
-                            choices=["tiny", "base", "small", "medium", "large-v3"],
+                            choices=["tiny", "base", "small", "medium", "large-v2", "large-v3"],
                             value="base",
-                            label="📏 Model Size (faster-whisper only)",
+                            label="📏 Model Size",
                             info="Larger = more accurate but slower"
                         )
                         
@@ -614,10 +796,16 @@ def create_gradio_interface():
                         )
                         
                         video_device = gr.Radio(
-                            choices=["cpu", "cuda"],
+                            choices=["cpu", "cuda", "mps"],
                             value="cpu",
                             label="💻 Device",
-                            info="Use CUDA if you have a compatible NVIDIA GPU"
+                            info="cpu: All models | cuda: All models (NVIDIA GPU) | mps: WhisperX only (Apple M1/M2/M3)"
+                        )
+                        
+                        video_enable_diarization = gr.Checkbox(
+                            value=False,
+                            label="👥 Enable Speaker Diarization (WhisperX only)",
+                            info="Identifies different speakers (requires HF_TOKEN env variable)"
                         )
                         
                         speed_multiplier = gr.Slider(
@@ -715,7 +903,7 @@ def create_gradio_interface():
         # Event handlers - Live Recording
         start_btn.click(
             fn=app.start_recording,
-            inputs=[model_type, model_size, language, device],
+            inputs=[model_type, model_size, language, device, enable_diarization],
             outputs=[status_box, transcript_box]
         )
         
@@ -738,7 +926,7 @@ def create_gradio_interface():
         
         start_sim_btn.click(
             fn=app.start_video_simulation,
-            inputs=[video_model_type, video_model_size, video_language, video_device, speed_multiplier],
+            inputs=[video_model_type, video_model_size, video_language, video_device, speed_multiplier, video_enable_diarization],
             outputs=[sim_status_box, video_transcript_box]
         )
         
