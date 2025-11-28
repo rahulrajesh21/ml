@@ -23,7 +23,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from src.audio_capture import AudioCapture
 from src.live_transcription import LiveTranscriber
-from src.text_analysis import TextAnalyzer
+from src.text_analysis import TextAnalyzer, RoleBasedHighlightScorer
+import threading
+import queue
 
 
 class LiveMeetingApp:
@@ -41,6 +43,45 @@ class LiveMeetingApp:
         self.is_transcribing_video = False
         self.text_analyzer = None
 
+        # New attributes for the refactored approach
+        self.highlight_scorer: Optional[RoleBasedHighlightScorer] = None
+        self.is_recording = False
+        self.audio_queue = queue.Queue()
+        self.transcription_queue = queue.Queue()
+        self.transcription_thread: Optional[threading.Thread] = None
+        self.analysis_thread: Optional[threading.Thread] = None
+        self.device: str = "cpu" # Default, will be set by UI
+        self.model_type: str = "faster-whisper" # Default, will be set by UI
+        self.model_size: str = "small" # Default, will be set by UI
+        self.language: str = "en" # Default, will be set by UI
+        self.enable_diarization: bool = False # Default, will be set by UI
+        self.transcription_callback = None
+        self.analysis_callback = None
+        self.stop_event = threading.Event()
+
+        # State for UI updates
+        self.transcript_segments = [] # Stores dicts of {'text': ..., 'start': ..., 'end': ..., 'speaker': ...}
+        self.highlights = []
+        self.summary = ""
+        self.action_items = ""
+        self.sentiment_scores = {} # e.g., {'positive': 0.5, 'negative': 0.2, 'neutral': 0.3}
+
+        # Speaker tracking for diarization
+        self.current_speaker = "Speaker 1"
+        self.speaker_change_count = 0
+        self.speaker_timers = {} # {speaker_name: total_time_spoken}
+        self.total_duration = 0.0
+        self.last_segment_end_time = 0.0
+        self.last_speaker_change_time = 0.0
+        self.speaker_stats = {} # {speaker_name: {'time': ..., 'words': ...}}
+        self.speaker_colors = ["#FFD700", "#87CEEB", "#90EE90", "#FF6347", "#BA55D3", "#FFA07A", "#20B2AA", "#DA70D6"]
+        self.color_index = 0
+        self.speaker_color_map = {} # {speaker_name: color_hex}
+        self.speaker_id_counter = 1
+        self.speaker_id_map = {} # {whisperx_speaker_label: "Speaker X"}
+        self.speaker_id_reverse_map = {} # {"Speaker X": whisperx_speaker_label}
+        self.speaker_id_colors = {} # {"Speaker X": color_hex}
+        self.speaker_id_color_index = 0
 
         
     def initialize_components(
@@ -77,9 +118,14 @@ class LiveMeetingApp:
         # Initialize text analyzer (lazy load or background load could be better, but simple for now)
         if not self.text_analyzer:
             print("Initializing Text Analyzer...")
-            self.text_analyzer = TextAnalyzer(device=device)
-
+            # Initialize Text Analyzer
+        self.text_analyzer = TextAnalyzer(device=self.device)
         
+        # Initialize Highlight Scorer
+        self.highlight_scorer = RoleBasedHighlightScorer(text_analyzer=self.text_analyzer)
+        
+        # State variables
+        self.is_recording = False
         # Get OpenAI API key from environment if using OpenAI
         openai_api_key = None
         if model_type == "openai":
@@ -292,6 +338,35 @@ class LiveMeetingApp:
         except Exception as e:
             return f"❌ Error loading video: {str(e)}\n\nMake sure the file path is correct and the video format is supported."
     
+    def get_role_vector(self, role: str) -> str:
+        """
+        Get the numerical vector for a role.
+        
+        Args:
+            role: Role name
+            
+        Returns:
+            Formatted string representation of the vector
+        """
+        # Lazy initialization of TextAnalyzer
+        if not self.text_analyzer:
+            print("Initializing Text Analyzer (Lazy Load)...")
+            try:
+                self.text_analyzer = TextAnalyzer(device=self.device)
+            except Exception as e:
+                return f"❌ Error initializing Text Analyzer: {str(e)}"
+            
+        embedding = self.text_analyzer.get_role_embedding(role)
+        
+        if not embedding:
+            return "❌ Could not extract embedding."
+            
+        # Format for display
+        dim = len(embedding)
+        preview = ", ".join([f"{x:.4f}" for x in embedding[:8]])
+        
+        return f"Vector Dimension: {dim}\n\nFirst 8 values:\n[{preview}, ...]\n\nFull Vector (truncated):\n{str(embedding)[:500]}..."
+    
     def transcribe_video(
         self,
         model_type: str,
@@ -402,22 +477,27 @@ class LiveMeetingApp:
             self.is_transcribing_video = False
             return f"❌ Error transcribing video: {str(e)}", ""
 
-    def analyze_transcript(self) -> tuple[str, str, float]:
+    def analyze_transcript(self, manual_text=None) -> tuple[str, str, float]:
         """
-        Analyze the current transcript for sentiment.
+        Analyze the current transcript using BERT.
+        """
+        # Use manual text if provided, otherwise use generated transcript
+        text_to_analyze = manual_text if manual_text and manual_text.strip() else self.transcript_text
         
-        Returns:
-            Tuple of (status, sentiment_label, sentiment_score)
-        """
-        if not self.transcript_text:
-            return "⚠️ No transcript to analyze!", "N/A", 0.0
+        if not text_to_analyze:
+            return "⚠️ No transcript to analyze.", "N/A", 0.0
             
+        # Lazy initialization of TextAnalyzer
         if not self.text_analyzer:
-            return "⚠️ Text Analyzer not initialized!", "ERROR", 0.0
+            print("Initializing Text Analyzer (Lazy Load)...")
+            try:
+                self.text_analyzer = TextAnalyzer(device=self.device)
+            except Exception as e:
+                return f"❌ Error initializing Text Analyzer: {str(e)}", "ERROR", 0.0
             
         try:
             print("Analyzing transcript sentiment...")
-            result = self.text_analyzer.analyze_sentiment(self.transcript_text)
+            result = self.text_analyzer.analyze_sentiment(text_to_analyze)
             
             label = result['label']
             score = result['score']
@@ -427,6 +507,39 @@ class LiveMeetingApp:
             
         except Exception as e:
             return f"❌ Error analyzing transcript: {str(e)}", "ERROR", 0.0
+
+    def generate_highlights(self, role: str, manual_text=None) -> str:
+        """
+        Generate highlights for a specific role.
+        """
+        text_to_analyze = manual_text if manual_text and manual_text.strip() else self.transcript_text
+        
+        if not text_to_analyze:
+            return "⚠️ No transcript to analyze."
+            
+        # Lazy initialization of Highlight Scorer
+        if not self.highlight_scorer:
+            print("Initializing Highlight Scorer (Lazy Load)...")
+            # Ensure TextAnalyzer is ready first
+            if not self.text_analyzer:
+                try:
+                    self.text_analyzer = TextAnalyzer(device=self.device)
+                except:
+                    return "❌ Error initializing Text Analyzer for scoring."
+            
+            self.highlight_scorer = RoleBasedHighlightScorer(text_analyzer=self.text_analyzer)
+            
+        highlights = self.highlight_scorer.extract_highlights(text_to_analyze, role)
+        
+        if not highlights:
+            return f"No specific highlights found for {role}."
+            
+        formatted_highlights = f"### ✨ Highlights for {role}\n\n"
+        for i, highlight in enumerate(highlights, 1):
+            formatted_highlights += f"**{i}.** {highlight}\n\n"
+            
+        return formatted_highlights
+
 
 
     
@@ -593,6 +706,21 @@ def create_gradio_interface():
                             outputs=transcript_box,
                             every=1
                         )
+
+                        # Role Embedding Visualization (Safe Implementation)
+                        with gr.Group():
+                            gr.Markdown("### 🧠 View Role Embeddings (Phase 1)")
+                            gr.Markdown("Visualize the numerical vector for a role.")
+                            with gr.Row():
+                                embed_role_input = gr.Textbox(label="Role Name", value="Developer")
+                                embed_btn = gr.Button("🔢 Get Vector")
+                            embed_output = gr.Textbox(label="Vector Output", lines=5)
+                            
+                            embed_btn.click(
+                                fn=app.get_role_vector,
+                                inputs=[embed_role_input],
+                                outputs=[embed_output]
+                            )
             
             # Tab 2: Video Transcription
             with gr.Tab("🎬 Video Transcription"):
@@ -705,7 +833,23 @@ def create_gradio_interface():
                 gr.Markdown("Analyze the transcript for sentiment and tone using BERT.")
                 
                 with gr.Row():
+                    manual_transcript_box = gr.Textbox(
+                        label="📝 Transcript Input",
+                        placeholder="Paste text here or load from generated transcript...",
+                        lines=10
+                    )
+                
+                with gr.Row():
+                    load_transcript_btn = gr.Button("⬇️ Load Generated Transcript", size="sm")
                     analyze_btn = gr.Button("🔍 Analyze Transcript", variant="primary", size="lg")
+                
+                def refresh_manual_box():
+                    return app.transcript_text
+                    
+                load_transcript_btn.click(
+                    fn=refresh_manual_box,
+                    outputs=[manual_transcript_box]
+                )
                 
                 with gr.Row():
                     with gr.Column():
@@ -716,8 +860,29 @@ def create_gradio_interface():
                 
                 analyze_btn.click(
                     fn=app.analyze_transcript,
+                    inputs=[manual_transcript_box],
                     outputs=[analysis_status, sentiment_label, sentiment_score]
                 )
+
+                gr.Markdown("---")
+                gr.Markdown("### ✨ Role-Based Highlights")
+                
+                with gr.Row():
+                    role_dropdown = gr.Dropdown(
+                        choices=["Developer", "Product Manager", "Designer", "QA Engineer", "Scrum Master"],
+                        label="Select Role",
+                        value="Developer"
+                    )
+                    highlight_btn = gr.Button("✨ Generate Highlights")
+                
+                highlights_box = gr.Textbox(label="Highlights", lines=5)
+                
+                highlight_btn.click(
+                    fn=app.generate_highlights,
+                    inputs=[role_dropdown, manual_transcript_box],
+                    outputs=[highlights_box]
+                )
+
 
             # Tab 4: Export & Settings
             with gr.Tab("💾 Export & Settings"):
