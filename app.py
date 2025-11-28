@@ -541,8 +541,8 @@ class LiveMeetingApp:
             return f"No specific highlights found for {role}."
             
         formatted_highlights = f"### ✨ Highlights for {role}\n\n"
-        for i, highlight in enumerate(highlights, 1):
-            formatted_highlights += f"**{i}.** {highlight}\n\n"
+        for i, (highlight, score) in enumerate(highlights, 1):
+            formatted_highlights += f"**{i}.** (Score: {score:.2f}) {highlight}\n\n"
             
         return formatted_highlights
 
@@ -651,8 +651,8 @@ class LiveMeetingApp:
             highlights = self.highlight_scorer.extract_highlights(transcript_text, role)
             if highlights:
                 full_output += f"### ✨ Highlights for {role}\n\n"
-                for i, h in enumerate(highlights, 1):
-                    full_output += f"**{i}.** {h}\n\n"
+                for i, (h, score) in enumerate(highlights, 1):
+                    full_output += f"**{i}.** (Score: {score:.2f}) {h}\n\n"
             else:
                 full_output += f"### ✨ Highlights for {role}\n*(No specific highlights found)*\n\n"
                 

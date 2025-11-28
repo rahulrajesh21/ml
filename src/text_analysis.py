@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Tuple
 import torch
 from transformers import pipeline, AutoTokenizer, AutoModel
 import torch.nn.functional as F
@@ -269,10 +269,11 @@ class RoleBasedHighlightScorer:
         
         return float(role_similarity)
         
-    def extract_highlights(self, text: str, role: str, top_n: int = 3) -> List[str]:
+    def extract_highlights(self, text: str, role: str, top_n: int = 3) -> List[Tuple[str, float]]:
         """
         Extract the top N most relevant sentences for a given role.
         Strictly filters for sentences spoken by the role if speaker tags are present.
+        Returns a list of (sentence, score) tuples.
         """
         if not text or not self.text_analyzer:
             return []
@@ -334,7 +335,7 @@ class RoleBasedHighlightScorer:
         unique_highlights = []
         for s in scored_sentences:
             if s[1] not in seen:
-                unique_highlights.append(s[1])
+                unique_highlights.append((s[1], round(s[0], 2)))
                 seen.add(s[1])
                 if len(unique_highlights) >= top_n:
                     break
