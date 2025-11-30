@@ -183,40 +183,39 @@ class RoleBasedHighlightScorer:
     def __init__(self, text_analyzer: Optional[TextAnalyzer] = None):
         self.text_analyzer = text_analyzer
         
-        # Define semantic descriptions for each role
-        self.role_descriptions = {
-            "Developer": "Technical details about code, APIs, databases, bugs, latency, servers, deployment, git, refactoring, and software architecture.",
-            "Product Manager": "Product strategy, user requirements, roadmap, KPIs, launch dates, customer feedback, market analysis, and feature prioritization.",
-            "Designer": "User interface visuals, color palettes, typography, layout, user experience flows, prototypes, wireframes, and design consistency.",
-            "QA Engineer": "Testing procedures, bug reproduction, test cases, automation scripts, regression testing, and quality verification.",
-            "Scrum Master": "Agile ceremonies, sprint velocity, blockers, standups, retrospectives, team capacity, and process improvements."
-        }
+        # Description for important/substantive meeting content
+        # This captures decisions, insights, proposals, concerns - regardless of role
+        self.importance_description = """
+        Important business decisions, strategic proposals, key insights, data-driven observations,
+        problem identification, solution suggestions, action items, concerns raised, 
+        metrics discussion, process improvements, technical explanations, resource allocation,
+        timeline commitments, risk assessment, and substantive professional contributions.
+        """
         
-        # Generic description for filtering
-        self.generic_description = "General meeting pleasantries, scheduling, administrative tasks, greetings, farewells, small talk, and vague project management statements like 'let's get started' or 'thanks for joining'."
+        # Generic description for filtering out non-substantive content
+        self.generic_description = """
+        General meeting pleasantries, scheduling, administrative tasks, greetings, farewells, 
+        small talk, thank you messages, expressions of gratitude like 'Thanks Eric' or 'Thank you Steve',
+        acknowledgments, transitions like 'let's get started', 'thanks for joining', 'moving on',
+        short affirmations like 'yeah', 'okay', 'right', 'got it', 'sounds good',
+        and vague statements without specific content.
+        """
         
-        # Cache for role embeddings
+        # Cache for embeddings
         self.role_embeddings = {}
+        self._importance_embedding = None
         
-    def _get_role_embedding(self, role: str) -> Optional[np.ndarray]:
-        """Get or compute embedding for a role description."""
-        if role in self.role_embeddings:
-            return self.role_embeddings[role]
+    def _get_importance_embedding(self) -> Optional[np.ndarray]:
+        """Get or compute embedding for important/substantive content."""
+        if self._importance_embedding is not None:
+            return self._importance_embedding
             
         if not self.text_analyzer:
             return None
             
-        description = self.role_descriptions.get(role)
-        
-        # If no pre-defined description, use the role name itself as the semantic query
-        if not description:
-            # We can enhance this by adding some context
-            # e.g. "Discussion relevant to [Role]"
-            description = f"Discussion relevant to {role}, including responsibilities, tasks, and updates related to {role}."
-            
-        embedding = self.text_analyzer.get_embedding(description)
+        embedding = self.text_analyzer.get_embedding(self.importance_description)
         if embedding is not None:
-            self.role_embeddings[role] = embedding
+            self._importance_embedding = embedding
             
         return embedding
 
@@ -234,41 +233,80 @@ class RoleBasedHighlightScorer:
             
         return embedding
         
-    def score_sentence(self, sentence: str, role: str) -> float:
+    def score_sentence(self, sentence: str, role: str = None) -> float:
         """
-        Score a sentence based on Cosine Similarity between the sentence embedding
-        and the role description embedding.
+        Score a sentence based on its importance/substantiveness.
+        Compares sentence embedding against 'important content' description
+        and penalizes generic/filler content.
+        
+        Args:
+            sentence: The sentence to score
+            role: (unused, kept for API compatibility)
         """
-        if not sentence or not role or not self.text_analyzer:
+        if not sentence or not self.text_analyzer:
+            return 0.0
+        
+        # Skip very short sentences (likely filler)
+        if len(sentence.split()) < 4:
             return 0.0
             
         # Get embeddings
-        role_emb = self._get_role_embedding(role)
+        importance_emb = self._get_importance_embedding()
         sent_emb = self.text_analyzer.get_embedding(sentence)
         
-        if role_emb is None or sent_emb is None:
+        if importance_emb is None or sent_emb is None:
             return 0.0
             
-        # Compute Cosine Similarity
-        # 1 - cosine_distance = cosine_similarity
-        # Range: [-1, 1], where 1 is identical
-        role_similarity = 1 - cosine(role_emb, sent_emb)
+        # Compute similarity to "important content"
+        importance_similarity = 1 - cosine(importance_emb, sent_emb)
         
-        # Check against Generic role
+        # Check against Generic/filler content
         generic_emb = self._get_generic_embedding()
         if generic_emb is not None:
             generic_similarity = 1 - cosine(generic_emb, sent_emb)
             
-            # If the sentence is more generic than specific to the role, penalize heavily
-            if generic_similarity > role_similarity:
+            # If the sentence is more generic than important, return 0
+            if generic_similarity > importance_similarity:
                 return 0.0
             
-            # Or if it's just very generic (high generic score), penalize
-            if generic_similarity > 0.4:
-                role_similarity -= (generic_similarity * 0.5)
+            # Penalize sentences that are somewhat generic
+            if generic_similarity > 0.35:
+                importance_similarity -= (generic_similarity * 0.5)
         
-        return float(role_similarity)
+        return max(0.0, float(importance_similarity))
         
+    def _normalize_speaker(self, speaker: str) -> str:
+        """Normalize speaker name for comparison."""
+        # Remove extra whitespace and convert to lowercase
+        normalized = speaker.lower().strip()
+        # Remove common punctuation that might differ
+        normalized = normalized.replace("'", "").replace('"', "").replace("-", " ")
+        return normalized
+    
+    def _speakers_match(self, role: str, speaker: str) -> bool:
+        """Check if a role matches a speaker tag."""
+        role_norm = self._normalize_speaker(role)
+        speaker_norm = self._normalize_speaker(speaker)
+        
+        # Exact match
+        if role_norm == speaker_norm:
+            return True
+        
+        # Role contains speaker or vice versa (handles partial matches)
+        if role_norm in speaker_norm or speaker_norm in role_norm:
+            return True
+        
+        # Check if the name part matches (before parentheses)
+        # "Eric Johnson (CTO)" should match "Eric Johnson (CTO - Host)"
+        import re
+        role_name = re.split(r'\s*\(', role_norm)[0].strip()
+        speaker_name = re.split(r'\s*\(', speaker_norm)[0].strip()
+        
+        if role_name and speaker_name and (role_name == speaker_name):
+            return True
+        
+        return False
+
     def extract_highlights(self, text: str, role: str, top_n: int = 3) -> List[Tuple[str, float]]:
         """
         Extract the top N most relevant sentences for a given role.
@@ -310,7 +348,7 @@ class RoleBasedHighlightScorer:
             for sentence in sentences:
                 all_sentences.append(sentence)
                 # Check if this sentence was spoken by the target role
-                if current_speaker and role.lower() in current_speaker.lower():
+                if current_speaker and self._speakers_match(role, current_speaker):
                     role_sentences.append(sentence)
         
         # DECISION: If we found sentences spoken by the role, ONLY analyze those.
@@ -319,11 +357,11 @@ class RoleBasedHighlightScorer:
         target_pool = role_sentences if role_sentences else all_sentences
         
         for sentence in target_pool:
-            # Base semantic score
-            score = self.score_sentence(sentence, role)
+            # Score based on importance/substantiveness
+            score = self.score_sentence(sentence)
             
-            # Filter out low relevance (threshold 0.25)
-            if score > 0.25:
+            # Filter out low importance (threshold 0.20)
+            if score > 0.20:
                 scored_sentences.append((score, sentence))
                 
         # Sort by score descending

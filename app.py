@@ -6,7 +6,7 @@ Provides real-time transcription with controls and export functionality.
 import gradio as gr
 import time
 import threading
-from typing import Optional
+from typing import Optional, List, Dict
 import os
 import sys
 import json
@@ -24,6 +24,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 from src.audio_capture import AudioCapture
 from src.live_transcription import LiveTranscriber
 from src.text_analysis import TextAnalyzer, RoleBasedHighlightScorer
+from src.visual_analysis import VisualAnalyzer
+from src.audio_analysis import AudioTonalAnalyzer, load_audio_file, LIBROSA_AVAILABLE
+from src.fusion_layer import FusionLayer, SegmentFeatures
 import threading
 import queue
 
@@ -42,6 +45,10 @@ class LiveMeetingApp:
         self.video_audio_path = None
         self.is_transcribing_video = False
         self.text_analyzer = None
+        self.visual_analyzer: Optional[VisualAnalyzer] = None
+        self.audio_tonal_analyzer: Optional[AudioTonalAnalyzer] = None
+        self.fusion_layer: Optional[FusionLayer] = None
+        self.cached_audio_data: Optional[np.ndarray] = None  # Cache for fusion analysis
 
         # New attributes for the refactored approach
         self.highlight_scorer: Optional[RoleBasedHighlightScorer] = None
@@ -424,6 +431,35 @@ class LiveMeetingApp:
                 enable_diarization=enable_diarization
             )
             
+            # Initialize Visual Analyzer (Lazy Load)
+            if not self.visual_analyzer:
+                print("Initializing Visual Analyzer...")
+                try:
+                    self.visual_analyzer = VisualAnalyzer(device=device)
+                except Exception as e:
+                    print(f"Warning: Visual Analyzer failed to init: {e}")
+
+            # Run Visual Analysis (Parallel or Sequential)
+            visual_context = ""
+            if self.visual_analyzer and self.visual_analyzer.is_ready:
+                print("Running Visual Analysis...")
+                # Run in a separate thread or just sequentially for now (it takes time)
+                # For better UX, we might want to do this async, but let's keep it simple
+                visual_results = self.visual_analyzer.analyze_video_context(self.video_audio_path)
+                
+                # Format results
+                slide_count = sum(1 for r in visual_results if r.get('is_slide'))
+                visual_context = f"### 🖼️ Visual Context Analysis\n\n"
+                visual_context += f"**Slides Detected:** {slide_count}\n\n"
+                
+                for r in visual_results:
+                    if r.get('is_slide'):
+                        timestamp = time.strftime('%H:%M:%S', time.gmtime(r['timestamp']))
+                        visual_context += f"**[{timestamp}] Slide Detected** (Conf: {r.get('slide_confidence',0):.2f})\n"
+                        visual_context += f"> *{r.get('ocr_text', '').strip()}*\n\n"
+            else:
+                visual_context = "Visual Analysis skipped (Analyzer not ready)."
+            
             self.transcript_text = ""
             
             # Extract full audio
@@ -477,11 +513,11 @@ class LiveMeetingApp:
             word_count = len(self.transcript_text.split())
             status = f"✅ Transcription complete at {timestamp}\n\n📊 Statistics:\n- Total words: {word_count}\n\n💾 Transcript is ready for export."
             
-            return status, self.transcript_text
+            return status, self.transcript_text, visual_context
             
         except Exception as e:
             self.is_transcribing_video = False
-            return f"❌ Error transcribing video: {str(e)}", ""
+            return f"❌ Error transcribing video: {str(e)}", "", ""
 
     def analyze_transcript(self, manual_text=None) -> tuple[str, str, float]:
         """
@@ -683,6 +719,241 @@ class LiveMeetingApp:
         except Exception as e:
             return f"❌ Error listing devices: {str(e)}"
 
+    def analyze_audio_tonal(self) -> tuple[str, str]:
+        """
+        Analyze audio tonal/prosodic features (MFCCs, pitch, energy) from the loaded video.
+        
+        Returns:
+            Tuple of (status message, analysis results)
+        """
+        if not LIBROSA_AVAILABLE:
+            return "❌ librosa not installed. Run: pip install librosa", ""
+        
+        if not self.video_audio_path or not os.path.exists(self.video_audio_path):
+            return "⚠️ Please load a video first.", ""
+        
+        try:
+            # Initialize analyzer if needed
+            if not self.audio_tonal_analyzer:
+                print("Initializing Audio Tonal Analyzer...")
+                self.audio_tonal_analyzer = AudioTonalAnalyzer(sample_rate=16000)
+            
+            # Load audio from video
+            print(f"Loading audio from: {self.video_audio_path}")
+            audio_data = load_audio_file(self.video_audio_path, sample_rate=16000)
+            
+            if audio_data is None:
+                return "❌ Failed to load audio from video.", ""
+            
+            # Extract prosodic features
+            print("Extracting prosodic features...")
+            features = self.audio_tonal_analyzer.extract_prosodic_features(audio_data)
+            
+            # Detect emphasis regions
+            print("Detecting emphasis regions...")
+            emphasis_regions = self.audio_tonal_analyzer.detect_emphasis_regions(audio_data)
+            
+            # Get MFCC embedding
+            mfcc_embedding = self.audio_tonal_analyzer.get_mfcc_embedding(audio_data)
+            
+            # Format results
+            results = "### 🎵 Audio Tonal Analysis (MFCCs & Prosodic Features)\n\n"
+            results += "#### Prosodic Features\n"
+            results += f"- **Energy (Mean):** {features['energy_mean']:.4f}\n"
+            results += f"- **Energy (Std):** {features['energy_std']:.4f}\n"
+            results += f"- **Pitch (Mean):** {features['pitch_mean']:.1f} Hz\n"
+            results += f"- **Pitch (Std):** {features['pitch_std']:.1f} Hz\n"
+            results += f"- **Speech Rate (ZCR):** {features['speech_rate']:.4f}\n\n"
+            
+            results += "#### Computed Scores\n"
+            results += f"- **Urgency Score:** {features['urgency_score']:.2f} (0-1 scale)\n"
+            results += f"- **Emphasis Score:** {features['emphasis_score']:.2f} (0-1 scale)\n\n"
+            
+            if emphasis_regions:
+                results += f"#### Emphasis Regions Detected: {len(emphasis_regions)}\n"
+                for i, (start, end, intensity) in enumerate(emphasis_regions[:10], 1):
+                    start_fmt = time.strftime('%H:%M:%S', time.gmtime(start))
+                    end_fmt = time.strftime('%H:%M:%S', time.gmtime(end))
+                    results += f"- **Region {i}:** {start_fmt} - {end_fmt} (intensity: {intensity:.4f})\n"
+                if len(emphasis_regions) > 10:
+                    results += f"- ... and {len(emphasis_regions) - 10} more regions\n"
+            else:
+                results += "#### No significant emphasis regions detected.\n"
+            
+            results += "\n#### MFCC Embedding\n"
+            if mfcc_embedding is not None:
+                results += f"- **Dimension:** {len(mfcc_embedding)}\n"
+                preview = ", ".join([f"{x:.3f}" for x in mfcc_embedding[:8]])
+                results += f"- **First 8 values:** [{preview}, ...]\n"
+            
+            # Cache audio for fusion analysis
+            self.cached_audio_data = audio_data
+            
+            return "✅ Audio tonal analysis complete!", results
+            
+        except Exception as e:
+            return f"❌ Error analyzing audio: {str(e)}", ""
+
+    def run_fusion_analysis(
+        self,
+        role: str,
+        fusion_strategy: str,
+        weight_semantic: float,
+        weight_tonal: float,
+        weight_role: float
+    ) -> tuple[str, str]:
+        """
+        Run multi-modal fusion analysis combining text, audio, and role signals.
+        
+        Args:
+            role: Target role for relevance scoring
+            fusion_strategy: "weighted", "multiplicative", or "gated"
+            weight_semantic: Weight for semantic score
+            weight_tonal: Weight for tonal score
+            weight_role: Weight for role relevance
+            
+        Returns:
+            Tuple of (status, results)
+        """
+        if not self.transcript_text:
+            return "⚠️ No transcript available. Please transcribe a video first.", ""
+        
+        try:
+            # Initialize components if needed
+            if not self.text_analyzer:
+                print("Initializing Text Analyzer...")
+                self.text_analyzer = TextAnalyzer(device=self.device)
+            
+            if not self.audio_tonal_analyzer and LIBROSA_AVAILABLE:
+                print("Initializing Audio Tonal Analyzer...")
+                self.audio_tonal_analyzer = AudioTonalAnalyzer(sample_rate=16000)
+            
+            # Load audio if not cached
+            if self.cached_audio_data is None and self.video_audio_path:
+                print("Loading audio for fusion analysis...")
+                self.cached_audio_data = load_audio_file(self.video_audio_path, sample_rate=16000)
+            
+            # Normalize weights
+            total_weight = weight_semantic + weight_tonal + weight_role
+            if total_weight > 0:
+                weights = {
+                    'semantic': weight_semantic / total_weight,
+                    'tonal': weight_tonal / total_weight,
+                    'role': weight_role / total_weight
+                }
+            else:
+                weights = {'semantic': 0.5, 'tonal': 0.2, 'role': 0.3}
+            
+            # Initialize fusion layer
+            self.fusion_layer = FusionLayer(
+                text_analyzer=self.text_analyzer,
+                audio_analyzer=self.audio_tonal_analyzer,
+                fusion_strategy=fusion_strategy,
+                weights=weights
+            )
+            
+            # Set role embeddings if available
+            if self.role_embeddings:
+                self.fusion_layer.set_role_embeddings(self.role_embeddings)
+            
+            # Parse transcript into segments
+            segments = self._parse_transcript_to_segments()
+            
+            if not segments:
+                return "⚠️ Could not parse transcript into segments.", ""
+            
+            # Score segments
+            print(f"Scoring {len(segments)} segments for role: {role}")
+            scored_segments = self.fusion_layer.score_segments(
+                segments,
+                role,
+                self.cached_audio_data,
+                sample_rate=16000
+            )
+            
+            # Get top segments
+            top_segments = self.fusion_layer.get_top_segments(scored_segments, top_n=10, min_score=0.2)
+            
+            # Format results
+            results = f"### 🔀 Multi-Modal Fusion Analysis\n\n"
+            results += f"**Target Role:** {role}\n"
+            results += f"**Strategy:** {fusion_strategy}\n"
+            results += f"**Weights:** Semantic={weights['semantic']:.2f}, Tonal={weights['tonal']:.2f}, Role={weights['role']:.2f}\n\n"
+            results += f"**Segments Analyzed:** {len(segments)}\n"
+            results += f"**Top Highlights:** {len(top_segments)}\n\n"
+            results += "---\n\n"
+            
+            for i, seg in enumerate(top_segments, 1):
+                time_fmt = time.strftime('%H:%M:%S', time.gmtime(seg.start_time))
+                results += f"#### {i}. [{time_fmt}] (Score: {seg.fused_score:.2f})\n"
+                results += f"> {seg.text}\n\n"
+                results += f"- Semantic: {seg.semantic_score:.2f} | "
+                results += f"Tonal: {seg.tonal_score:.2f} | "
+                results += f"Role: {seg.role_relevance:.2f}\n"
+                
+                if seg.prosodic_features:
+                    pf = seg.prosodic_features
+                    results += f"- Urgency: {pf.get('urgency_score', 0):.2f}, "
+                    results += f"Emphasis: {pf.get('emphasis_score', 0):.2f}\n"
+                results += "\n"
+            
+            # Summary statistics
+            if scored_segments:
+                avg_semantic = np.mean([s.semantic_score for s in scored_segments])
+                avg_tonal = np.mean([s.tonal_score for s in scored_segments])
+                avg_role = np.mean([s.role_relevance for s in scored_segments])
+                avg_fused = np.mean([s.fused_score for s in scored_segments])
+                
+                results += "---\n\n"
+                results += "### 📊 Summary Statistics\n\n"
+                results += f"- **Avg Semantic Score:** {avg_semantic:.3f}\n"
+                results += f"- **Avg Tonal Score:** {avg_tonal:.3f}\n"
+                results += f"- **Avg Role Relevance:** {avg_role:.3f}\n"
+                results += f"- **Avg Fused Score:** {avg_fused:.3f}\n"
+            
+            return "✅ Fusion analysis complete!", results
+            
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            return f"❌ Error in fusion analysis: {str(e)}", ""
+    
+    def _parse_transcript_to_segments(self) -> List[Dict]:
+        """Parse transcript text into segment dictionaries."""
+        import re
+        
+        segments = []
+        lines = self.transcript_text.strip().split('\n')
+        
+        # Pattern: [HH:MM:SS] [Speaker] Text or [HH:MM:SS] Text
+        pattern = re.compile(r'\[(\d{2}:\d{2}:\d{2})\]\s*(?:\[(.*?)\])?\s*(.*)')
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            match = pattern.match(line)
+            if match:
+                timestamp_str = match.group(1)
+                speaker = match.group(2)
+                text = match.group(3).strip()
+                
+                if not text:
+                    continue
+                
+                # Parse timestamp to seconds
+                parts = timestamp_str.split(':')
+                seconds = int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+                
+                segments.append({
+                    'start': float(seconds),
+                    'end': float(seconds + 3),  # Estimate 3 second duration
+                    'text': text,
+                    'speaker': speaker
+                })
+        
+        return segments
 
 
 def create_gradio_interface():
@@ -915,6 +1186,13 @@ def create_gradio_interface():
                     interactive=False,
                     lines=6
                 )
+                
+                visual_context_box = gr.Textbox(
+                    label="🖼️ Visual Context (Slides)",
+                    placeholder="Visual analysis results (slides, OCR text) will appear here...",
+                    lines=10,
+                    interactive=False
+                )
             
             # Tab 3: Role Mapping
             with gr.Tab("👥 Role Mapping"):
@@ -1040,6 +1318,67 @@ def create_gradio_interface():
                     inputs=[role_dropdown, manual_transcript_box],
                     outputs=[highlights_box]
                 )
+                
+                gr.Markdown("---")
+                gr.Markdown("### 🎵 Audio Tonal Analysis (MFCCs)")
+                gr.Markdown("Extract prosodic features like pitch, energy, and emphasis patterns that indicate urgency or importance.")
+                
+                with gr.Row():
+                    tonal_analyze_btn = gr.Button("🎵 Analyze Audio Tonal Features", variant="primary", size="lg")
+                
+                with gr.Row():
+                    tonal_status = gr.Textbox(label="Status", lines=2)
+                
+                tonal_results_box = gr.Textbox(
+                    label="Tonal Analysis Results",
+                    lines=20,
+                    interactive=False,
+                    show_copy_button=True
+                )
+                
+                tonal_analyze_btn.click(
+                    fn=app.analyze_audio_tonal,
+                    outputs=[tonal_status, tonal_results_box]
+                )
+                
+                gr.Markdown("---")
+                gr.Markdown("### 🔀 Multi-Modal Fusion Analysis")
+                gr.Markdown("Combine semantic (text), tonal (audio), and role signals for hyper-relevant highlights.")
+                
+                with gr.Row():
+                    fusion_role = gr.Dropdown(
+                        choices=["Developer", "Product Manager", "Designer", "QA Engineer", "Scrum Master", "Tech Lead", "Data Scientist"],
+                        value="Product Manager",
+                        label="🎯 Target Role"
+                    )
+                    fusion_strategy = gr.Radio(
+                        choices=["weighted", "multiplicative", "gated"],
+                        value="weighted",
+                        label="⚙️ Fusion Strategy",
+                        info="weighted: linear combo | multiplicative: tonal boost | gated: role filters"
+                    )
+                
+                gr.Markdown("#### Fusion Weights")
+                with gr.Row():
+                    weight_semantic = gr.Slider(0, 1, value=0.5, step=0.1, label="Semantic (What)")
+                    weight_tonal = gr.Slider(0, 1, value=0.2, step=0.1, label="Tonal (How)")
+                    weight_role = gr.Slider(0, 1, value=0.3, step=0.1, label="Role (Who)")
+                
+                fusion_btn = gr.Button("🔀 Run Fusion Analysis", variant="primary", size="lg")
+                
+                fusion_status = gr.Textbox(label="Status", lines=2)
+                fusion_results = gr.Textbox(
+                    label="Fusion Results",
+                    lines=25,
+                    interactive=False,
+                    show_copy_button=True
+                )
+                
+                fusion_btn.click(
+                    fn=app.run_fusion_analysis,
+                    inputs=[fusion_role, fusion_strategy, weight_semantic, weight_tonal, weight_role],
+                    outputs=[fusion_status, fusion_results]
+                )
 
 
             # Tab 4: Export & Settings
@@ -1089,7 +1428,7 @@ def create_gradio_interface():
         start_sim_btn.click(
             fn=app.transcribe_video,
             inputs=[video_model_type, video_model_size, video_language, video_device, video_enable_diarization],
-            outputs=[sim_status_box, video_transcript_box]
+            outputs=[sim_status_box, video_transcript_box, visual_context_box]
         )
         
         # Event handlers - Export
