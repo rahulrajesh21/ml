@@ -2,6 +2,7 @@
 import os
 import cv2
 import torch
+import torch.nn as nn
 import numpy as np
 from PIL import Image
 from typing import List, Dict, Tuple, Optional
@@ -15,13 +16,16 @@ class VisualAnalyzer:
     """
     Analyzer for extracting visual features and context from video frames.
     Implements:
-    1. ResNet-50 Feature Extraction (Visual Encoder)
-    2. OCR for Slide Text Extraction (Context)
+    1. Fine-tuned ResNet-50 for Context Classification (Slide vs Person)
+    2. Feature Extraction for Similarity (Embeddings)
+    3. OCR for Text Extraction
     """
     
-    def __init__(self, device: str = "cpu"):
+    def __init__(self, device: str = "cpu", model_path: str = "resnet50_meeting_context.pth"):
         self.device = device
-        self.resnet_model = None
+        self.model_path = model_path
+        self.feature_extractor = None
+        self.classifier = None
         self.transform = None
         self.ocr_reader = None
         self.is_ready = False
@@ -30,29 +34,43 @@ class VisualAnalyzer:
         self._initialize_models()
         
     def _initialize_models(self):
-        """Initialize ResNet-50 and EasyOCR."""
+        """Initialize Fine-Tuned ResNet-50 and EasyOCR."""
         try:
             logger.info(f"Initializing VisualAnalyzer on {self.device}...")
             
             # 1. Load ResNet-50
             from torchvision import models, transforms
             
-            # Use pretrained=True for compatibility with older torchvision versions
-            self.resnet_model = models.resnet50(pretrained=True)
+            # Initialize standard ResNet-50 structure
+            full_model = models.resnet50(pretrained=False) # We load custom weights
             
-            # Remove the classification layer (fc) to get feature vectors
-            # ResNet-50 fc layer input is 2048
-            self.resnet_model = torch.nn.Sequential(*list(self.resnet_model.children())[:-1])
+            # Modify the final layer to match our fine-tuning (2 classes)
+            num_ftrs = full_model.fc.in_features
+            full_model.fc = nn.Linear(num_ftrs, 2)
             
-            self.resnet_model.eval()
+            # Load custom weights if available
+            if os.path.exists(self.model_path):
+                logger.info(f"Loading fine-tuned model from {self.model_path}")
+                state_dict = torch.load(self.model_path, map_location=self.device)
+                full_model.load_state_dict(state_dict)
+            else:
+                logger.warning(f"Fine-tuned model not found at {self.model_path}. Using random weights (Context results will be poor).")
+            
+            full_model.eval()
             
             # Handle device
             if self.device == "cuda" and torch.cuda.is_available():
-                self.resnet_model = self.resnet_model.to("cuda")
+                full_model = full_model.to("cuda")
             elif self.device == "mps" and torch.backends.mps.is_available():
-                self.resnet_model = self.resnet_model.to("mps")
+                full_model = full_model.to("mps")
+                
+            # Split into Feature Extractor and Classifier
+            # Features: All layers except the last fc
+            self.feature_extractor = nn.Sequential(*list(full_model.children())[:-1])
+            # Classifier: The last fc layer
+            self.classifier = full_model.fc
             
-            # Define transform manually since weights.transforms() might not exist
+            # Define transform (standard ImageNet normalization)
             self.transform = transforms.Compose([
                 transforms.Resize(256),
                 transforms.CenterCrop(224),
@@ -60,9 +78,8 @@ class VisualAnalyzer:
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ])
             
-            # 2. Load EasyOCR (Lazy load recommended for speed, but we'll do it here)
+            # 2. Load EasyOCR
             import easyocr
-            # gpu=True if cuda is available, easyocr handles mps poorly sometimes so stick to cpu or cuda
             use_gpu = (self.device == "cuda")
             self.ocr_reader = easyocr.Reader(['en'], gpu=use_gpu, verbose=False)
             
@@ -74,16 +91,7 @@ class VisualAnalyzer:
             self.is_ready = False
 
     def extract_frames(self, video_path: str, interval: float = 2.0) -> List[Tuple[float, np.ndarray]]:
-        """
-        Extract frames from video at a given time interval.
-        
-        Args:
-            video_path: Path to video file
-            interval: Time in seconds between frames
-            
-        Returns:
-            List of (timestamp, frame_bgr) tuples
-        """
+        """Extract frames from video at a given time interval."""
         if not os.path.exists(video_path):
             logger.error(f"Video file not found: {video_path}")
             return []
@@ -112,119 +120,77 @@ class VisualAnalyzer:
         cap.release()
         return frames
 
-    def get_visual_embedding(self, frame_bgr: np.ndarray) -> Optional[np.ndarray]:
+    def process_frame(self, frame_bgr: np.ndarray) -> Tuple[Optional[np.ndarray], str, float]:
         """
-        Get ResNet-50 feature vector for a frame.
-        
-        Args:
-            frame_bgr: BGR image from OpenCV
-            
-        Returns:
-            2048-dim numpy array
+        Process a single frame to get:
+        1. Visual Embedding (2048-dim)
+        2. Context Label (Slide/Person)
+        3. Context Confidence
         """
-        if not self.is_ready or self.resnet_model is None:
-            return None
+        if not self.is_ready or self.feature_extractor is None:
+            return None, "Unknown", 0.0
             
         try:
-            # Convert BGR to RGB
+            # Preprocess
             frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
             pil_image = Image.fromarray(frame_rgb)
-            
-            # Transform
             input_tensor = self.transform(pil_image).unsqueeze(0)
             
             # Move to device
-            if next(self.resnet_model.parameters()).device.type != 'cpu':
-                input_tensor = input_tensor.to(next(self.resnet_model.parameters()).device)
+            device = next(self.feature_extractor.parameters()).device
+            input_tensor = input_tensor.to(device)
             
-            # Forward pass
             with torch.no_grad():
-                output = self.resnet_model(input_tensor)
+                # 1. Get Features (Embedding)
+                # Output shape: [1, 2048, 1, 1]
+                features = self.feature_extractor(input_tensor)
+                embedding = features.squeeze().cpu().numpy()
                 
-            # Flatten: [1, 2048, 1, 1] -> [2048]
-            embedding = output.squeeze().cpu().numpy()
-            
-            # Normalize
-            norm = np.linalg.norm(embedding)
-            if norm > 0:
-                embedding = embedding / norm
+                # Normalize embedding
+                norm = np.linalg.norm(embedding)
+                if norm > 0:
+                    embedding = embedding / norm
                 
-            return embedding
+                # 2. Get Classification (Context)
+                # Flatten features for fc layer: [1, 2048]
+                flat_features = features.view(features.size(0), -1)
+                logits = self.classifier(flat_features)
+                probs = torch.softmax(logits, dim=1)
+                
+                # Classes: 0=Person, 1=Slide (Based on our training order)
+                # We assume alphabetical order from ImageFolder unless specified otherwise.
+                # In our notebook: Person (0), Slide (1)
+                slide_prob = probs[0][1].item()
+                person_prob = probs[0][0].item()
+                
+                if slide_prob > person_prob:
+                    label = "Slide"
+                    conf = slide_prob
+                else:
+                    label = "Person"
+                    conf = person_prob
+                    
+            return embedding, label, conf
             
         except Exception as e:
-            logger.error(f"Error extracting visual embedding: {e}")
-            return None
+            logger.error(f"Error processing frame: {e}")
+            return None, "Error", 0.0
 
-    def extract_slide_info(self, frame_bgr: np.ndarray) -> Tuple[str, bool, float]:
-        """
-        Extract text and determine if the frame is likely a presentation slide.
-        
-        Args:
-            frame_bgr: BGR image from OpenCV
-            
-        Returns:
-            Tuple of (full_text, is_slide, confidence_score)
-        """
+    def extract_ocr_text(self, frame_bgr: np.ndarray) -> str:
+        """Extract text from frame using EasyOCR."""
         if not self.is_ready or self.ocr_reader is None:
-            return "", False, 0.0
+            return ""
             
         try:
-            # Get detailed results: List of (bbox, text, prob)
-            results = self.ocr_reader.readtext(frame_bgr, detail=1)
-            
-            if not results:
-                return "", False, 0.0
-            
-            # Filter low confidence text
-            valid_text = []
-            total_conf = 0.0
-            text_area = 0.0
-            
-            height, width, _ = frame_bgr.shape
-            frame_area = height * width
-            
-            for bbox, text, prob in results:
-                if prob > 0.4: # Confidence threshold
-                    valid_text.append(text)
-                    total_conf += prob
-                    
-                    # Estimate area of text box
-                    # bbox is [[x1,y1], [x2,y2], [x3,y3], [x4,y4]]
-                    # Approximate width/height
-                    w = abs(bbox[1][0] - bbox[0][0])
-                    h = abs(bbox[2][1] - bbox[1][1])
-                    text_area += (w * h)
-            
-            full_text = " ".join(valid_text)
-            
-            # Heuristic for "Is this a slide?":
-            # 1. Significant amount of text (at least 3 words/blocks)
-            # 2. Text covers a reasonable portion of screen (optional, but good for large titles)
-            # 3. High average confidence
-            
-            is_slide = False
-            score = 0.0
-            
-            if len(valid_text) >= 3:
-                is_slide = True
-                score = total_conf / len(valid_text)
-            elif len(valid_text) > 0 and (text_area / frame_area) > 0.05:
-                # Large text (title slide?)
-                is_slide = True
-                score = total_conf / len(valid_text)
-                
-            return full_text, is_slide, score
-            
+            results = self.ocr_reader.readtext(frame_bgr, detail=0)
+            return " ".join(results)
         except Exception as e:
             logger.error(f"Error extracting text: {e}")
-            return "", False, 0.0
+            return ""
 
     def analyze_video_context(self, video_path: str) -> List[Dict]:
         """
-        Full pipeline: Extract frames -> Get Embeddings -> Get OCR Text -> Detect Slide.
-        
-        Returns:
-            List of dicts: {'timestamp': float, 'embedding': np.array, 'ocr_text': str, 'is_slide': bool}
+        Full pipeline: Extract frames -> Get Embeddings -> Classify Context -> OCR.
         """
         frames = self.extract_frames(video_path, interval=5.0) # Every 5 seconds
         results = []
@@ -232,17 +198,23 @@ class VisualAnalyzer:
         logger.info(f"Analyzing {len(frames)} frames from video...")
         
         for timestamp, frame in frames:
-            embedding = self.get_visual_embedding(frame)
-            text, is_slide, conf = self.extract_slide_info(frame)
+            # 1. Visual Analysis (Embedding + Context)
+            embedding, label, conf = self.process_frame(frame)
             
-            # Only store if we have meaningful data
+            # 2. OCR (Only if it looks like a slide to save time, or always?)
+            # Let's do it always for now to be safe, or optimize later.
+            ocr_text = ""
+            if label == "Slide" or conf < 0.7: # Read text if it's a slide or we are unsure
+                ocr_text = self.extract_ocr_text(frame)
+            
             if embedding is not None:
                 results.append({
                     'timestamp': timestamp,
                     'embedding': embedding,
-                    'ocr_text': text,
-                    'is_slide': is_slide,
-                    'slide_confidence': conf
+                    'context_label': label,
+                    'context_confidence': conf,
+                    'ocr_text': ocr_text,
+                    'is_slide': (label == "Slide") # Backward compatibility
                 })
                 
         return results
