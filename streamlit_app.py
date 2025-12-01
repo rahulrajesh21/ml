@@ -1,3 +1,4 @@
+
 """
 Streamlit-based web interface for live meeting transcription.
 Provides real-time transcription with controls and export functionality.
@@ -14,6 +15,7 @@ from datetime import datetime
 import subprocess
 import numpy as np
 from dotenv import load_dotenv
+import shutil
 
 # Load environment variables
 load_dotenv()
@@ -27,6 +29,7 @@ from src.text_analysis import TextAnalyzer, RoleBasedHighlightScorer
 from src.visual_analysis import VisualAnalyzer
 from src.audio_analysis import AudioTonalAnalyzer, load_audio_file, LIBROSA_AVAILABLE
 from src.fusion_layer import FusionLayer, SegmentFeatures
+from src.video_processing import VideoSummarizer
 
 # Page config
 st.set_page_config(
@@ -50,7 +53,8 @@ def init_session_state():
         'role_mapping': {},
         'role_embeddings': {},
         'transcriber': None,
-        'device': 'cpu'
+        'device': 'cpu',
+        'scored_segments': None # Store scored segments for video generation
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -215,29 +219,28 @@ with tab1:
     col1, col2 = st.columns([1, 2])
     
     with col1:
-        video_path = st.text_input(
-            "Video File Path",
-            placeholder="/path/to/your/video.mp4",
-            help="Enter the full path to your video file"
-        )
+        uploaded_file = st.file_uploader("Upload Video", type=['mp4', 'mov', 'avi', 'mkv'])
         
-        if st.button("📂 Load Video", type="secondary"):
-            if video_path and os.path.exists(video_path):
-                try:
-                    from moviepy import VideoFileClip
-                    video = VideoFileClip(video_path)
-                    if video.audio is None:
-                        st.error("Video has no audio track")
-                    else:
-                        duration = video.duration
-                        st.session_state.video_audio_path = video_path
-                        st.success(f"✅ Video loaded! Duration: {duration:.1f}s")
-                    video.close()
-                except Exception as e:
-                    st.error(f"Error: {e}")
-            else:
-                st.warning("Please enter a valid video path")
-        
+        if uploaded_file is not None:
+            # Save to temp directory
+            os.makedirs("temp_uploads", exist_ok=True)
+            file_path = os.path.join("temp_uploads", uploaded_file.name)
+            
+            with open(file_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            
+            st.session_state.video_audio_path = file_path
+            
+            # Get duration
+            try:
+                from moviepy import VideoFileClip
+                video = VideoFileClip(file_path)
+                duration = video.duration
+                video.close()
+                st.success(f"✅ Video loaded! Duration: {duration:.1f}s")
+            except Exception as e:
+                st.warning(f"Could not read video metadata: {e}")
+
         st.divider()
         
         if st.button("▶️ Transcribe Video", type="primary", disabled=not st.session_state.video_audio_path):
@@ -502,6 +505,9 @@ with tab4:
                             sample_rate=16000
                         )
                         
+                        # Store for video generation
+                        st.session_state.scored_segments = scored_segments
+                        
                         # Get top segments
                         top_segments = fusion_layer.get_top_segments(scored_segments, top_n=10, min_score=0.2)
                         
@@ -553,6 +559,78 @@ with tab4:
                 except Exception as e:
                     import traceback
                     st.error(f"Error: {e}")
+                    st.code(traceback.format_exc())
+
+    st.divider()
+    st.subheader("🎬 Generate Video Summary")
+    
+    if st.button("🎥 Generate Role-Specific Video Summary"):
+        if not st.session_state.scored_segments:
+            st.warning("Please run Fusion Analysis first to generate scores.")
+        elif not st.session_state.video_audio_path:
+            st.warning("No video file loaded.")
+        else:
+            with st.spinner("Generating temporally smoothed video summary..."):
+                try:
+                    # Initialize summarizer (highlight scorer not strictly needed here as we have fused scores)
+                    # We can pass None or a dummy scorer if needed, but VideoSummarizer init takes one.
+                    # Let's reuse the existing one or create a dummy.
+                    scorer = get_highlight_scorer()
+                    summarizer = VideoSummarizer(scorer)
+                    
+                    # Convert SegmentFeatures to dicts expected by filter_and_smooth
+                    # filter_and_smooth expects dicts with 'score', 'start', 'end'
+                    segments_for_smoothing = []
+                    for seg in st.session_state.scored_segments:
+                        segments_for_smoothing.append({
+                            'start': seg.start_time,
+                            'end': seg.end_time,
+                            'score': seg.fused_score,
+                            'text': seg.text
+                        })
+                    
+                    # 1. Temporal Smoothing
+                    # Merge adjacent high-score clips
+                    time_ranges = summarizer.filter_and_smooth(
+                        segments_for_smoothing,
+                        threshold=0.4,  # Adjustable threshold
+                        min_gap=2.0,    # Merge if gap < 2s
+                        padding=0.5     # Add 0.5s padding
+                    )
+                    
+                    if not time_ranges:
+                        st.warning("No segments met the threshold for the summary.")
+                    else:
+                        st.info(f"Generated {len(time_ranges)} clips after smoothing.")
+                        
+                        # 2. Generate Video
+                        output_filename = f"summary_{fusion_role.replace(' ', '_')}_{int(time.time())}.mp4"
+                        output_path = os.path.join("exports", output_filename)
+                        os.makedirs("exports", exist_ok=True)
+                        
+                        result_path = summarizer.create_summary_video(
+                            st.session_state.video_audio_path,
+                            time_ranges,
+                            output_path
+                        )
+                        
+                        st.success(f"✅ Video Summary Generated: {output_filename}")
+                        
+                        # Display video
+                        st.video(result_path)
+                        
+                        # Download button
+                        with open(result_path, "rb") as file:
+                            st.download_button(
+                                label="⬇️ Download Summary Video",
+                                data=file,
+                                file_name=output_filename,
+                                mime="video/mp4"
+                            )
+                            
+                except Exception as e:
+                    import traceback
+                    st.error(f"Error generating video: {e}")
                     st.code(traceback.format_exc())
 
 
@@ -621,12 +699,13 @@ st.markdown("""
 ---
 ### 📖 How to Use
 
-1. **Load Video**: Enter path and click Load Video
-2. **Transcribe**: Select model settings and click Transcribe Video
-3. **Map Roles**: Assign speaker IDs to professional roles
-4. **Analyze**: Run sentiment, highlights, or tonal analysis
-5. **Fusion**: Combine all signals for hyper-relevant highlights
-6. **Export**: Download transcript in your preferred format
+1. **Load Video**: Upload a video file in the first tab.
+2. **Transcribe**: Select model settings and click Transcribe Video.
+3. **Map Roles**: Assign speaker IDs to professional roles.
+4. **Analyze**: Run sentiment, highlights, or tonal analysis.
+5. **Fusion**: Combine all signals for hyper-relevant highlights.
+6. **Generate Video**: Create a temporally smoothed video summary for the target role.
+7. **Export**: Download transcript in your preferred format.
 
 **Tips:**
 - Use `whisperx` with diarization for speaker identification
