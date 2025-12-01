@@ -121,13 +121,26 @@ class FusionLayer:
         self.role_embeddings = role_embeddings
         logger.info(f"Loaded {len(role_embeddings)} role embeddings")
     
-    def _get_importance_embedding(self) -> Optional[np.ndarray]:
-        """Get cached embedding for 'important content' description."""
-        if self._importance_embedding is not None:
-            return self._importance_embedding
+    def _get_importance_embedding(self, focus_query: Optional[str] = None) -> Optional[np.ndarray]:
+        """
+        Get cached embedding for 'important content' description or custom focus.
         
+        Args:
+            focus_query: Optional custom focus query (e.g., "budget concerns")
+            
+        Returns:
+            Embedding vector
+        """
         if not self.text_analyzer:
             return None
+            
+        # If custom focus is provided, generate embedding on the fly (don't cache globally)
+        if focus_query and focus_query.strip():
+            return self.text_analyzer.get_embedding(focus_query)
+        
+        # Default importance embedding (cached)
+        if self._importance_embedding is not None:
+            return self._importance_embedding
         
         importance_desc = """
         Important business decisions, strategic proposals, key insights,
@@ -143,7 +156,8 @@ class FusionLayer:
     def compute_semantic_score(
         self,
         text: str,
-        text_embedding: Optional[np.ndarray] = None
+        text_embedding: Optional[np.ndarray] = None,
+        focus_query: Optional[str] = None
     ) -> Tuple[float, Optional[np.ndarray]]:
         """
         Compute semantic importance score for text.
@@ -151,6 +165,7 @@ class FusionLayer:
         Args:
             text: The text content
             text_embedding: Pre-computed embedding (optional)
+            focus_query: Optional custom focus query
             
         Returns:
             Tuple of (score, embedding)
@@ -165,8 +180,8 @@ class FusionLayer:
         if text_embedding is None:
             return 0.0, None
         
-        # Compare to importance description
-        importance_emb = self._get_importance_embedding()
+        # Compare to importance description or focus query
+        importance_emb = self._get_importance_embedding(focus_query)
         if importance_emb is None:
             return 0.0, text_embedding
         
@@ -302,7 +317,8 @@ class FusionLayer:
         segment: SegmentFeatures,
         role: str,
         audio_data: Optional[np.ndarray] = None,
-        sample_rate: int = 16000
+        sample_rate: int = 16000,
+        focus_query: Optional[str] = None
     ) -> SegmentFeatures:
         """
         Score a single segment using all modalities.
@@ -312,6 +328,7 @@ class FusionLayer:
             role: Target role for relevance scoring
             audio_data: Full audio array (for extracting segment audio)
             sample_rate: Audio sample rate
+            focus_query: Optional custom focus query
             
         Returns:
             SegmentFeatures with all scores populated
@@ -319,7 +336,8 @@ class FusionLayer:
         # 1. Semantic score
         semantic_score, text_emb = self.compute_semantic_score(
             segment.text,
-            segment.text_embedding
+            segment.text_embedding,
+            focus_query
         )
         segment.semantic_score = semantic_score
         segment.text_embedding = text_emb
@@ -366,7 +384,8 @@ class FusionLayer:
         segments: List[Dict],
         role: str,
         audio_data: Optional[np.ndarray] = None,
-        sample_rate: int = 16000
+        sample_rate: int = 16000,
+        focus_query: Optional[str] = None
     ) -> List[SegmentFeatures]:
         """
         Score multiple segments.
@@ -376,6 +395,7 @@ class FusionLayer:
             role: Target role
             audio_data: Full audio array
             sample_rate: Audio sample rate
+            focus_query: Optional custom focus query
             
         Returns:
             List of scored SegmentFeatures
@@ -394,7 +414,8 @@ class FusionLayer:
                 features,
                 role,
                 audio_data,
-                sample_rate
+                sample_rate,
+                focus_query
             )
             scored.append(scored_segment)
         

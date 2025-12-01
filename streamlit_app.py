@@ -62,6 +62,19 @@ def init_session_state():
 
 init_session_state()
 
+def check_ffmpeg():
+    """Check if FFmpeg is installed and accessible."""
+    try:
+        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+
+if not check_ffmpeg():
+    st.error("🚨 FFmpeg is not installed or not found in system PATH. Please install FFmpeg to use this app.")
+    st.info("Windows: `winget install Gyan.FFmpeg` or download from ffmpeg.org and add to PATH.")
+    st.stop()
+
 
 # Helper functions
 def get_text_analyzer():
@@ -203,7 +216,8 @@ with st.sidebar:
             st.error(f"Error: {e}")
 
 # Main tabs
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "🎙️ Live Recording",
     "🎬 Video Transcription",
     "👥 Role Mapping", 
     "📊 Analysis",
@@ -212,10 +226,101 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 ])
 
 
-# Tab 1: Video Transcription
+# Tab 1: Live Recording
 with tab1:
-    st.header("🎬 Video Transcription")
+    st.header("🎙️ Live Recording")
     
+    col1, col2 = st.columns([1, 2])
+    
+    with col1:
+        st.markdown("Record meeting audio directly.")
+        
+        if 'recording' not in st.session_state:
+            st.session_state.recording = False
+            
+        if not st.session_state.recording:
+            if st.button("🔴 Start Recording", type="primary"):
+                st.session_state.recording = True
+                st.session_state.audio_capture = AudioCapture()
+                st.session_state.audio_capture.start_recording()
+                st.rerun()
+        else:
+            st.error("Recording in progress...")
+            if st.button("⏹️ Stop Recording"):
+                st.session_state.recording = False
+                if 'audio_capture' in st.session_state:
+                    st.session_state.audio_capture.stop_recording()
+                    # Save to file
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    filename = f"recording_{timestamp}.wav"
+                    os.makedirs("recordings", exist_ok=True)
+                    filepath = os.path.join("recordings", filename)
+                    st.session_state.audio_capture.save_wav(filepath)
+                    st.session_state.audio_capture.cleanup()
+                    del st.session_state.audio_capture
+                    
+                    st.session_state.video_audio_path = filepath
+                    st.success(f"Recording saved: {filename}")
+                    st.rerun()
+    
+    with col2:
+        if st.session_state.recording:
+            st.warning("🎙️ Microphone is active. Speak clearly.")
+            st.spinner("Recording...")
+        elif st.session_state.video_audio_path and st.session_state.video_audio_path.endswith(".wav"):
+            st.audio(st.session_state.video_audio_path)
+            
+            if st.button("▶️ Transcribe Recording", type="primary"):
+                 with st.spinner("Transcribing recording..."):
+                    try:
+                        # Reuse transcribe_video logic but for audio file
+                        # We need to adapt transcribe_video slightly or just call transcriber directly
+                        if st.session_state.transcriber is None:
+                             st.session_state.transcriber = LiveTranscriber(
+                                model_type=model_type,
+                                model_size=model_size,
+                                language=language if language != "auto" else None,
+                                device=device,
+                                enable_diarization=enable_diarization
+                            )
+                        
+                        # Read audio file
+                        with open(st.session_state.video_audio_path, "rb") as f:
+                            audio_bytes = f.read()
+                        
+                        # Transcribe
+                        # For simplicity, just use the full audio transcription
+                        # We need to convert bytes to numpy for some methods, but let's use the file path if possible
+                        # The existing transcribe_full_audio takes bytes or numpy
+                        
+                        import wave
+                        with wave.open(st.session_state.video_audio_path, 'rb') as wf:
+                            frames = wf.readframes(wf.getnframes())
+                            sample_rate = wf.getframerate()
+                            
+                        segments_generator = st.session_state.transcriber.transcribe_full_audio(frames, sample_rate)
+                        
+                        full_text = ""
+                        for segment in segments_generator:
+                            start_time = time.strftime('%H:%M:%S', time.gmtime(segment['start']))
+                            text = segment['text']
+                            speaker = segment.get('speaker')
+                            if speaker:
+                                line = f"[{start_time}] [{speaker}] {text}\n\n"
+                            else:
+                                line = f"[{start_time}] {text}\n\n"
+                            full_text += line
+                            
+                        st.session_state.transcript_text = full_text
+                        st.success("✅ Transcription complete!")
+                        
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+# Tab 2: Video Transcription (Existing)
+with tab2:
+    st.header("🎬 Video Transcription")
+    # ... (Existing video upload code) ...
     col1, col2 = st.columns([1, 2])
     
     with col1:
@@ -244,13 +349,62 @@ with tab1:
         st.divider()
         
         if st.button("▶️ Transcribe Video", type="primary", disabled=not st.session_state.video_audio_path):
-            with st.spinner("Transcribing video... This may take a while."):
+            progress_bar = st.progress(0, text="Starting transcription...")
+            
+            with st.spinner("Transcribing video..."):
                 try:
-                    transcript = transcribe_video(
-                        st.session_state.video_audio_path,
-                        model_type, model_size, language, device, enable_diarization
+                    # Initialize transcriber
+                    openai_api_key = os.getenv("OPENAI_API_KEY") if model_type == "openai" else None
+                    hf_token = os.getenv("HF_TOKEN") if model_type == "whisperx" else None
+                    actual_model_size = "whisper-1" if model_type == "openai" else model_size
+                    
+                    transcriber = LiveTranscriber(
+                        model_type=model_type,
+                        model_size=actual_model_size,
+                        language=language if language != "auto" else None,
+                        openai_api_key=openai_api_key,
+                        hf_token=hf_token,
+                        device=device,
+                        enable_diarization=enable_diarization
                     )
-                    st.session_state.transcript_text = transcript
+                    st.session_state.transcriber = transcriber
+                    
+                    # Extract audio
+                    progress_bar.progress(10, text="Extracting audio...")
+                    target_fps = 16000
+                    cmd = [
+                        'ffmpeg', '-i', st.session_state.video_audio_path, '-vn', '-acodec', 'pcm_s16le',
+                        '-ar', str(target_fps), '-ac', '1', '-f', 's16le', '-loglevel', 'error', '-'
+                    ]
+                    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+                    
+                    # Transcribe
+                    progress_bar.progress(20, text="Running AI model...")
+                    segments_generator = transcriber.transcribe_full_audio(result.stdout, target_fps)
+                    
+                    full_text = ""
+                    # We can't easily track progress of generator without consuming it
+                    # But we can update periodically
+                    
+                    segments = list(segments_generator) # Consume generator
+                    
+                    for i, segment in enumerate(segments):
+                        start_time = time.strftime('%H:%M:%S', time.gmtime(segment['start']))
+                        text = segment['text']
+                        speaker = segment.get('speaker')
+                        
+                        if speaker:
+                            mapped_name = st.session_state.role_mapping.get(speaker, speaker)
+                            line = f"[{start_time}] [{mapped_name}] {text}\n\n"
+                        else:
+                            line = f"[{start_time}] {text}\n\n"
+                        full_text += line
+                        
+                        # Update progress
+                        prog = 20 + int(70 * (i / len(segments)))
+                        progress_bar.progress(min(prog, 90), text=f"Processing segment {i+1}...")
+                    
+                    st.session_state.transcript_text = full_text
                     
                     # Cache audio for fusion
                     if LIBROSA_AVAILABLE:
@@ -258,6 +412,7 @@ with tab1:
                             st.session_state.video_audio_path, sample_rate=16000
                         )
                     
+                    progress_bar.progress(100, text="Done!")
                     st.success("✅ Transcription complete!")
                 except Exception as e:
                     st.error(f"Error: {e}")
@@ -273,10 +428,10 @@ with tab1:
         if transcript_display != st.session_state.transcript_text:
             st.session_state.transcript_text = transcript_display
 
-
-# Tab 2: Role Mapping
-with tab2:
+# Tab 3: Role Mapping (Existing)
+with tab3:
     st.header("👥 Role Mapping")
+    # ... (Existing role mapping code) ...
     st.markdown("Map speaker IDs to professional roles and generate semantic embeddings.")
     
     col1, col2 = st.columns(2)
@@ -333,14 +488,47 @@ with tab2:
         else:
             st.info("Apply mapping to see embeddings")
 
-
-# Tab 3: Analysis
-with tab3:
+# Tab 4: Analysis (Updated with LLM)
+with tab4:
     st.header("📊 Analysis")
     
-    # Sentiment Analysis
-    st.subheader("🧠 Sentiment Analysis")
+    # LLM Summary Section
+    st.subheader("🤖 AI Role-Based Summary")
+    col1, col2 = st.columns([1, 3])
+    with col1:
+        summary_role = st.selectbox("Summary for Role", ["General", "Product Manager", "Developer", "Designer", "Executive"])
+        summary_focus = st.text_input("Focus Area", value="key decisions and action items")
+        
+        if st.button("📝 Generate Summary"):
+            if not st.session_state.transcript_text:
+                st.warning("No transcript available.")
+            else:
+                with st.spinner("Generating AI summary..."):
+                    try:
+                        from src.llm_summarizer import LLMSummarizer
+                        if 'llm_summarizer' not in st.session_state:
+                            st.session_state.llm_summarizer = LLMSummarizer(device=st.session_state.device)
+                        
+                        summary = st.session_state.llm_summarizer.summarize(
+                            st.session_state.transcript_text,
+                            summary_role,
+                            summary_focus
+                        )
+                        st.session_state.ai_summary = summary
+                    except Exception as e:
+                        st.error(f"Error: {e}")
     
+    with col2:
+        if 'ai_summary' in st.session_state:
+            st.info(st.session_state.ai_summary)
+        else:
+            st.markdown("*Select a role and click Generate to see an AI-written summary.*")
+
+    st.divider()
+    
+    # Sentiment Analysis (Existing)
+    st.subheader("🧠 Sentiment Analysis")
+    # ... (Existing sentiment code) ...
     manual_text = st.text_area(
         "Transcript to Analyze",
         value=st.session_state.transcript_text,
@@ -364,36 +552,7 @@ with tab3:
     
     st.divider()
     
-    # Role-Based Highlights
-    st.subheader("✨ Role-Based Highlights")
-    
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        role_select = st.selectbox(
-            "Select Role",
-            ["Developer", "Product Manager", "Designer", "QA Engineer", "Scrum Master", "Tech Lead"]
-        )
-        
-        if st.button("✨ Generate Highlights"):
-            if st.session_state.transcript_text:
-                with st.spinner("Generating highlights..."):
-                    scorer = get_highlight_scorer()
-                    highlights = scorer.extract_highlights(st.session_state.transcript_text, role_select)
-                    st.session_state.highlights = highlights
-            else:
-                st.warning("No transcript available")
-    
-    with col2:
-        if 'highlights' in st.session_state and st.session_state.highlights:
-            for i, (text, score) in enumerate(st.session_state.highlights, 1):
-                st.markdown(f"**{i}.** (Score: {score:.2f}) {text}")
-        else:
-            st.info("Generate highlights to see results")
-    
-    st.divider()
-    
-    # Audio Tonal Analysis
+    # Audio Tonal Analysis (Existing)
     st.subheader("🎵 Audio Tonal Analysis (MFCCs)")
     
     if st.button("🎵 Analyze Audio Tonal Features"):
@@ -431,9 +590,8 @@ with tab3:
                 except Exception as e:
                     st.error(f"Error: {e}")
 
-
-# Tab 4: Fusion Analysis
-with tab4:
+# Tab 5: Fusion Analysis (Updated with Dynamic Focus)
+with tab5:
     st.header("🔀 Multi-Modal Fusion Analysis")
     st.markdown("Combine semantic (text), tonal (audio), and role signals for hyper-relevant highlights.")
     
@@ -451,6 +609,9 @@ with tab4:
             ["weighted", "multiplicative", "gated"],
             help="weighted: linear combo | multiplicative: tonal boost | gated: role filters"
         )
+        
+        # NEW: Dynamic Focus
+        focus_query = st.text_input("🔍 Custom Focus (Optional)", placeholder="e.g., budget concerns, deadlines")
     
     with col2:
         st.markdown("#### Fusion Weights")
@@ -497,12 +658,13 @@ with tab4:
                     if not segments:
                         st.warning("Could not parse transcript into segments")
                     else:
-                        # Score segments
+                        # Score segments with FOCUS QUERY
                         scored_segments = fusion_layer.score_segments(
                             segments,
                             fusion_role,
                             st.session_state.cached_audio_data,
-                            sample_rate=16000
+                            sample_rate=16000,
+                            focus_query=focus_query
                         )
                         
                         # Store for video generation
@@ -517,8 +679,8 @@ with tab4:
                         st.markdown(f"""
                         **Configuration:**
                         - Target Role: {fusion_role}
+                        - Focus: {focus_query if focus_query else 'General Importance'}
                         - Strategy: {fusion_strategy}
-                        - Weights: Semantic={weights['semantic']:.2f}, Tonal={weights['tonal']:.2f}, Role={weights['role']:.2f}
                         """)
                         
                         st.divider()
@@ -570,16 +732,11 @@ with tab4:
         elif not st.session_state.video_audio_path:
             st.warning("No video file loaded.")
         else:
-            with st.spinner("Generating temporally smoothed video summary..."):
+            with st.spinner("Generating smooth video summary..."):
                 try:
-                    # Initialize summarizer (highlight scorer not strictly needed here as we have fused scores)
-                    # We can pass None or a dummy scorer if needed, but VideoSummarizer init takes one.
-                    # Let's reuse the existing one or create a dummy.
                     scorer = get_highlight_scorer()
                     summarizer = VideoSummarizer(scorer)
                     
-                    # Convert SegmentFeatures to dicts expected by filter_and_smooth
-                    # filter_and_smooth expects dicts with 'score', 'start', 'end'
                     segments_for_smoothing = []
                     for seg in st.session_state.scored_segments:
                         segments_for_smoothing.append({
@@ -590,12 +747,11 @@ with tab4:
                         })
                     
                     # 1. Temporal Smoothing
-                    # Merge adjacent high-score clips
                     time_ranges = summarizer.filter_and_smooth(
                         segments_for_smoothing,
-                        threshold=0.4,  # Adjustable threshold
-                        min_gap=2.0,    # Merge if gap < 2s
-                        padding=0.5     # Add 0.5s padding
+                        threshold=0.4,
+                        min_gap=2.0,
+                        padding=1.0 # Increased padding for smoothness
                     )
                     
                     if not time_ranges:
@@ -603,7 +759,7 @@ with tab4:
                     else:
                         st.info(f"Generated {len(time_ranges)} clips after smoothing.")
                         
-                        # 2. Generate Video
+                        # 2. Generate Video with Crossfades
                         output_filename = f"summary_{fusion_role.replace(' ', '_')}_{int(time.time())}.mp4"
                         output_path = os.path.join("exports", output_filename)
                         os.makedirs("exports", exist_ok=True)
@@ -611,15 +767,13 @@ with tab4:
                         result_path = summarizer.create_summary_video(
                             st.session_state.video_audio_path,
                             time_ranges,
-                            output_path
+                            output_path,
+                            crossfade_duration=0.5 # Enable crossfade
                         )
                         
                         st.success(f"✅ Video Summary Generated: {output_filename}")
-                        
-                        # Display video
                         st.video(result_path)
                         
-                        # Download button
                         with open(result_path, "rb") as file:
                             st.download_button(
                                 label="⬇️ Download Summary Video",
@@ -633,11 +787,10 @@ with tab4:
                     st.error(f"Error generating video: {e}")
                     st.code(traceback.format_exc())
 
-
-# Tab 5: Export
-with tab5:
+# Tab 6: Export (Existing)
+with tab6:
     st.header("💾 Export Transcript")
-    
+    # ... (Existing export code) ...
     export_format = st.radio(
         "Export Format",
         ["txt", "json", "srt"],
