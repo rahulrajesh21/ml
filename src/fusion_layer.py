@@ -18,6 +18,14 @@ import logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+try:
+    from .ml_fusion import load_model, ContextualFusionTransformer
+    import torch
+    ML_AVAILABLE = True
+except ImportError:
+    ML_AVAILABLE = False
+    logger.warning("ML Fusion module not found. Falling back to heuristics.")
+
 
 @dataclass
 class SegmentFeatures:
@@ -115,6 +123,15 @@ class FusionLayer:
         self.role_embeddings: Dict[str, np.ndarray] = {}
         
         logger.info(f"FusionLayer initialized with strategy: {fusion_strategy}")
+        
+        # ML Model
+        self.ml_model = None
+        if ML_AVAILABLE:
+            try:
+                self.ml_model = load_model("fusion_model.pth")
+                logger.info("Loaded ML Fusion Model from fusion_model.pth")
+            except Exception as e:
+                logger.warning(f"Could not load ML model: {e}. Using heuristics.")
     
     def set_role_embeddings(self, role_embeddings: Dict[str, np.ndarray]):
         """Set pre-computed role embeddings."""
@@ -420,6 +437,83 @@ class FusionLayer:
             scored.append(scored_segment)
         
         return scored
+
+    def score_segments_contextual(
+        self,
+        segments: List[Dict],
+        role: str,
+        audio_data: Optional[np.ndarray] = None,
+        sample_rate: int = 16000,
+        focus_query: Optional[str] = None,
+        use_ml: bool = True
+    ) -> List[SegmentFeatures]:
+        """
+        Score segments using Contextual ML Model if available, else Heuristics.
+        """
+        # First, populate features (embeddings, etc.) using the standard scoring logic
+        # We need the embeddings for the ML model
+        scored_segments = self.score_segments(segments, role, audio_data, sample_rate, focus_query)
+        
+        if use_ml and self.ml_model and ML_AVAILABLE:
+            try:
+                import torch
+                
+                # Prepare Batch
+                # 1. Text
+                text_embs = [s.text_embedding if s.text_embedding is not None else np.zeros(384) for s in scored_segments]
+                text_tensor = torch.tensor(np.array(text_embs), dtype=torch.float32).unsqueeze(0) # (1, Seq, 384)
+                
+                # 2. Audio
+                audio_embs = []
+                for s in scored_segments:
+                    if s.mfcc_embedding is not None:
+                        emb = s.mfcc_embedding
+                        if len(emb) < 64:
+                            emb = np.pad(emb, (0, 64 - len(emb)))
+                        elif len(emb) > 64:
+                            emb = emb[:64]
+                        audio_embs.append(emb)
+                    else:
+                        audio_embs.append(np.zeros(64))
+                audio_tensor = torch.tensor(np.array(audio_embs), dtype=torch.float32).unsqueeze(0)
+                
+                # 3. Role
+                role_embs = []
+                # We need role embedding vector. compute_role_relevance uses it but doesn't store it in segment
+                # Let's fetch it from cache
+                role_vec = self.role_embeddings.get(role)
+                if role_vec is None and self.text_analyzer:
+                    role_vec = self.text_analyzer.get_embedding(role)
+                
+                if role_vec is None:
+                    role_vec = np.zeros(384)
+                    
+                # Repeat role vector for all segments (since role is constant for the query)
+                role_tensor = torch.tensor(np.array([role_vec] * len(scored_segments)), dtype=torch.float32).unsqueeze(0)
+                
+                # Inference
+                with torch.no_grad():
+                    scores = self.ml_model(text_tensor, audio_tensor, role_tensor)
+                    # scores: (1, Seq, 1)
+                    
+                # Assign scores
+                ml_scores = scores.squeeze().numpy()
+                if ml_scores.ndim == 0:
+                    ml_scores = [float(ml_scores)]
+                    
+                for i, seg in enumerate(scored_segments):
+                    seg.fused_score = float(ml_scores[i])
+                    # We keep the component scores (semantic, tonal, role) for explanation,
+                    # but override the fused_score with the ML prediction.
+                    
+                logger.info("Scored segments using ML Fusion Model")
+                return scored_segments
+                
+            except Exception as e:
+                logger.error(f"ML Scoring failed: {e}. Falling back to heuristics.")
+                return scored_segments
+        
+        return scored_segments
     
     def get_top_segments(
         self,

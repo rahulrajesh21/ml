@@ -610,6 +610,15 @@ with tab5:
             help="weighted: linear combo | multiplicative: tonal boost | gated: role filters"
         )
         
+        # NEW: Fusion Mode (Heuristic vs Neural)
+        fusion_mode = st.radio(
+            "🧠 Fusion Mode",
+            ["Heuristic", "Neural (ML)"],
+            help="Heuristic: Manual weights | Neural: Transformer model trained on importance"
+        )
+        
+        # NEW: Dynamic Focus
+        
         # NEW: Dynamic Focus
         focus_query = st.text_input("🔍 Custom Focus (Optional)", placeholder="e.g., budget concerns, deadlines")
     
@@ -659,13 +668,23 @@ with tab5:
                         st.warning("Could not parse transcript into segments")
                     else:
                         # Score segments with FOCUS QUERY
-                        scored_segments = fusion_layer.score_segments(
-                            segments,
-                            fusion_role,
-                            st.session_state.cached_audio_data,
-                            sample_rate=16000,
-                            focus_query=focus_query
-                        )
+                        if fusion_mode == "Neural (ML)":
+                            scored_segments = fusion_layer.score_segments_contextual(
+                                segments,
+                                fusion_role,
+                                st.session_state.cached_audio_data,
+                                sample_rate=16000,
+                                focus_query=focus_query,
+                                use_ml=True
+                            )
+                        else:
+                            scored_segments = fusion_layer.score_segments(
+                                segments,
+                                fusion_role,
+                                st.session_state.cached_audio_data,
+                                sample_rate=16000,
+                                focus_query=focus_query
+                            )
                         
                         # Store for video generation
                         st.session_state.scored_segments = scored_segments
@@ -722,6 +741,44 @@ with tab5:
                     import traceback
                     st.error(f"Error: {e}")
                     st.code(traceback.format_exc())
+
+    # NEW: Training Section
+    st.divider()
+    st.subheader("🎓 Train Neural Model")
+    st.markdown("Train the Neural Fusion model using the current transcript as a training example.")
+    
+    col1, col2 = st.columns([1, 2])
+    with col1:
+        if st.button("🧠 Train Model (Self-Supervised/LLM)"):
+            if not st.session_state.transcript_text:
+                st.warning("No transcript available for training.")
+            elif not st.session_state.scored_segments:
+                st.warning("Run Fusion Analysis first to generate features.")
+            else:
+                with st.spinner("Training Neural Model..."):
+                    try:
+                        from src.train_fusion import FusionTrainer
+                        from src.llm_summarizer import LLMSummarizer
+                        
+                        # Initialize LLM if needed
+                        if 'llm_summarizer' not in st.session_state:
+                            st.session_state.llm_summarizer = LLMSummarizer(device=st.session_state.device)
+                            
+                        trainer = FusionTrainer(st.session_state.llm_summarizer)
+                        
+                        # Train
+                        loss = trainer.train_step(st.session_state.scored_segments, epochs=5)
+                        
+                        st.success(f"✅ Training Complete! Final Loss: {loss:.4f}")
+                        st.info("Model saved to fusion_model.pth. Switch to 'Neural (ML)' mode to use it.")
+                        
+                        # Reload fusion layer to pick up new model
+                        st.session_state.fusion_layer = None 
+                        
+                    except Exception as e:
+                        import traceback
+                        st.error(f"Training failed: {e}")
+                        st.code(traceback.format_exc())
 
     st.divider()
     st.subheader("🎬 Generate Video Summary")

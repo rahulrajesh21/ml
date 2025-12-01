@@ -11,6 +11,10 @@ logger = logging.getLogger(__name__)
 # Add src to path
 sys.path.append(os.path.join(os.getcwd(), 'src'))
 
+# Load environment variables
+from dotenv import load_dotenv
+load_dotenv()
+
 # Import live_transcription FIRST to apply torch.load monkey-patch
 try:
     import live_transcription
