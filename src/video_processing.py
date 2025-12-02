@@ -1,6 +1,8 @@
 import os
 from typing import List, Dict, Tuple, Optional
 from moviepy import VideoFileClip, concatenate_videoclips
+from moviepy.audio.fx.AudioFadeIn import AudioFadeIn
+from moviepy.audio.fx.AudioFadeOut import AudioFadeOut
 from src.text_analysis import RoleBasedHighlightScorer
 
 class VideoSummarizer:
@@ -135,7 +137,9 @@ class VideoSummarizer:
                 clip = video.subclipped(start, end)
                 
                 # Apply fade in/out audio for smoothness
-                clip = clip.audio_fadein(0.1).audio_fadeout(0.1)
+                if clip.audio:
+                    new_audio = clip.audio.with_effects([AudioFadeIn(0.1), AudioFadeOut(0.1)])
+                    clip = clip.with_audio(new_audio)
                 
                 clips.append(clip)
                 
